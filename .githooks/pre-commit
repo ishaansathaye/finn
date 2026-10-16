@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+python3 scripts/check_public_tree.py
+if ! command -v gitleaks >/dev/null 2>&1; then
+  printf '%s\n' 'Install Gitleaks before committing public source.' >&2
+  exit 1
+fi
+gitleaks git --pre-commit --staged --redact --no-banner .
