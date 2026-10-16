@@ -49,6 +49,10 @@ set to the checkout and its ExecStart set to the virtualenv Python plus
 `scripts/run_telegram_polling.py`. Supply `PYTHONPATH=.` and private environment
 configuration. Do not launch a second poller for an already-running bot.
 
+SQLModel/SQLAlchemy and Ruff are pinned to the verified deployment versions.
+New SQLModel releases may change datetime storage semantics; do not upgrade
+them without a database migration review and full clean-install regression run.
+
 For container deployments, run the site's restart/redeploy procedure from the
 host, then inspect systemd status and logs inside the container. Hostnames,
 service secrets and personal infrastructure configuration are intentionally not
