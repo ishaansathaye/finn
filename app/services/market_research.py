@@ -5,7 +5,6 @@ import asyncio
 from datetime import UTC, date, datetime, timedelta
 from email.utils import parsedate_to_datetime
 import json
-import hashlib
 from math import floor, isfinite
 from math import log10
 import re
@@ -1127,30 +1126,49 @@ class MarketResearchService:
         return stock_packets, packet_map, ideas
 
     async def _stock_decisions(self, session: Session, packets: list[dict]) -> list[StockDecisionModel]:
+        from app.services.stock_analysis_cache import analysis_fingerprint, prices_within_reuse_window
+
         now = datetime.now(UTC)
         context = self._portfolio_context(session)
-        fingerprint = hashlib.sha256(json.dumps({"context": context, "packets": [
-            {"symbol": p["symbol"], "price_bucket": round(float(p.get("close") or 0), 0),
-             "holding_weight": p.get("holding_weight"), "scores": [p.get(k) for k in ("trend_score", "fundamental_score", "catalyst_score", "risk_penalty")],
-             "headlines": p.get("news_headlines"), "risk_flags": p.get("risk_flags"),
-             "fresh": p.get("quote_source") not in {"unknown", "stale_cache"},
-             "recent_action": (p.get("recent_state") or {}).get("recent_side")}
-            for p in packets]}, sort_keys=True, default=str).encode()).hexdigest()
-        cached = self.cache.get_json(session, "stock_intelligence", "llm_result", max_age_seconds=900)
-        if cached and cached.get("fingerprint") == fingerprint:
-            self.llm.stock_analysis_mode = "gemini_cached"
-            return [StockDecisionModel.model_validate(row) for row in cached["decisions"]]
+        fingerprint = analysis_fingerprint(context, packets, self.settings.gemini_model_analyst)
         health = self.cache.get_json_stale(session, "stock_intelligence", "llm_health") or {}
+        budget_day = now.date().isoformat()
+        used = int(health.get("requests_today") or 0) if health.get("budget_day") == budget_day else 0
+
+        def finish(decisions, mode, next_request_at=None):
+            self.llm.stock_analysis_mode = mode
+            self.cache.set_json(session, "stock_intelligence", "llm_scan", {
+                "checked_at": now.isoformat(), "mode": mode, "budget_day": budget_day,
+                "budget_timezone": "UTC", "requests_today": used,
+                "request_limit": self.settings.stock_llm_daily_request_budget,
+                "packet_count": len(packets), "next_request_at": next_request_at,
+            })
+            return decisions
+
+        if not packets:
+            return finish([], "rules_only_no_candidates")
+        if not self.llm.configured():
+            return finish(self.llm._fallback_stock_decisions(packets), "rules_only_not_configured")
+        cached = self.cache.get_json(session, "stock_intelligence", "llm_result", max_age_seconds=3600)
+        if (isinstance(cached, dict) and cached.get("fingerprint") == fingerprint
+                and prices_within_reuse_window(packets, cached.get("prices") or {})):
+            try:
+                decisions = [StockDecisionModel.model_validate(row) for row in cached["decisions"]]
+                if {d.symbol for d in decisions} == {p["symbol"] for p in packets} and len(decisions) == len(packets):
+                    return finish(decisions, "gemini_cached")
+            except (ValueError, TypeError, KeyError):
+                pass
         try:
             retry_at = datetime.fromisoformat(health.get("retry_after") or "")
             if retry_at.tzinfo is None:
                 retry_at = retry_at.replace(tzinfo=UTC)
         except (ValueError, TypeError):
             retry_at = now
-        used = int(health.get("requests_today") or 0) if health.get("budget_day") == now.date().isoformat() else 0
         if retry_at > now or used >= self.settings.stock_llm_daily_request_budget:
-            self.llm.stock_analysis_mode = "rules_only_quota_backoff" if retry_at > now else "rules_only_daily_budget"
-            return self.llm._fallback_stock_decisions(packets)
+            mode = "rules_only_quota_backoff" if retry_at > now else "rules_only_daily_budget"
+            reset = datetime.combine(now.date() + timedelta(days=1), datetime.min.time(), tzinfo=UTC)
+            return finish(self.llm._fallback_stock_decisions(packets), mode,
+                          max(retry_at, reset if used >= self.settings.stock_llm_daily_request_budget else now).isoformat())
         from zoneinfo import ZoneInfo
         eastern = now.astimezone(ZoneInfo("America/New_York"))
         market_window = eastern.weekday() < 5 and 510 <= eastern.hour * 60 + eastern.minute < 1020
@@ -1164,11 +1182,16 @@ class MarketResearchService:
         interval = 2700 if market_window else 14400
         if ((last_request is not None and (now-last_request).total_seconds() < interval)
                 or (not market_window and offhours_used >= max(1, self.settings.stock_llm_daily_request_budget // 6))):
-            self.llm.stock_analysis_mode = "rules_only_request_spacing" if market_window else "rules_only_market_reserve"
-            return self.llm._fallback_stock_decisions(packets)
+            mode = "rules_only_request_spacing" if market_window else "rules_only_market_reserve"
+            next_at = (last_request + timedelta(seconds=interval)).isoformat() if last_request else None
+            # An off-hours cap may last beyond the spacing window; do not promise an early request.
+            if not market_window and offhours_used >= max(1, self.settings.stock_llm_daily_request_budget // 6):
+                next_at = None
+            return finish(self.llm._fallback_stock_decisions(packets), mode, next_at)
         # Reserve before the request so a timeout cannot bypass the persisted budget.
         state = {"checked_at": now.isoformat(), "last_request_at": now.isoformat(), "budget_day": now.date().isoformat(),
                  "requests_today": used + 1, "requests_offhours": offhours_used + int(not market_window)}
+        used += 1
         self.cache.set_json(session, "stock_intelligence", "llm_health", state)
         decisions = await self.llm.analyze_stocks(portfolio_context=context, stock_packets=packets)
         retry_at = getattr(self.llm, "_stock_retry_after", None)
@@ -1176,8 +1199,9 @@ class MarketResearchService:
         self.cache.set_json(session, "stock_intelligence", "llm_health", state)
         if self.llm.stock_analysis_mode in {"gemini", "gemini_cached"}:
             self.cache.set_json(session, "stock_intelligence", "llm_result", {
-                "fingerprint": fingerprint, "decisions": [d.model_dump() for d in decisions]})
-        return decisions
+                "fingerprint": fingerprint, "decisions": [d.model_dump() for d in decisions],
+                "prices": {p["symbol"]: p.get("close") for p in packets}})
+        return finish(decisions, self.llm.stock_analysis_mode)
 
     async def top_stock_ideas(self, session: Session, limit: int = 7) -> list[StockIdea]:
         ideas, _news = await self.stock_report(session, stock_limit=limit, news_limit=3)

@@ -173,7 +173,8 @@ async def test_stock_budget_is_persistent(monkeypatch):
     SQLModel.metadata.create_all(engine)
     with Session(engine) as session:
         service = MarketResearchService()
-        service.settings = SimpleNamespace(stock_llm_daily_request_budget=1)
+        service.settings = SimpleNamespace(stock_llm_daily_request_budget=1, gemini_model_analyst="test-model")
+        monkeypatch.setattr(service.llm, "configured", lambda: True)
         monkeypatch.setattr(service, "_portfolio_context", lambda s: {})
         service.llm.stock_analysis_mode = "rules_only"
         service.llm.analyze_stocks = AsyncMock(return_value=service.llm._fallback_stock_decisions([packet()]))
@@ -181,6 +182,7 @@ async def test_stock_budget_is_persistent(monkeypatch):
         await service._stock_decisions(session, [packet()])
         second = MarketResearchService()
         second.settings = service.settings
+        monkeypatch.setattr(second.llm, "configured", lambda: True)
         monkeypatch.setattr(second, "_portfolio_context", lambda s: {})
         second.llm.analyze_stocks = AsyncMock(side_effect=AssertionError("must not call"))
         await second._stock_decisions(session, [packet()])
@@ -208,7 +210,7 @@ async def test_stock_pipeline_persists_evidence_and_keeps_bounded_sizes(monkeypa
         assert all(idea.confidence != "high" for idea in ideas)
         assert all(idea.amount_usd <= 500 for idea in ideas)
         latest = service.cache.get_json_stale(session, "stock_intelligence", "latest")
-        assert latest["analysis_mode"] == "rules_only"
+        assert latest["analysis_mode"] == "rules_only_not_configured"
         assert len(latest["packets"]) == 3
         assert len(service.cache.get_json_stale(session, "stock_intelligence", "evaluation_samples")) == 1
 

@@ -28,6 +28,7 @@ from app.models import (
     StockUniverseMember,
 )
 from app.services.market_research import MarketResearchService, StockIdea
+from app.services import stock_alert_diagnostics as alert_diagnostics
 
 
 class StockAdvisorService:
@@ -796,23 +797,56 @@ class StockAdvisorService:
         return f"Lane: {lane}. {idea.reason}"
 
     async def create_proactive_stock_batch(self, session: Session, batch_type: str = "stock-alert") -> RecommendationBatch | None:
+        scan = alert_diagnostics.begin_scan(session, self._now())
+        try:
+            batch = await self._create_proactive_stock_batch(session, batch_type, scan)
+        except Exception:
+            session.rollback()
+            scan["error"] = "stock_alert_scan_failed"
+            mode = getattr(getattr(self.market_research, "llm", None), "stock_analysis_mode", None)
+            scan["analysis_mode"] = mode if mode in alert_diagnostics.MODES else "unknown"
+            alert_diagnostics.finish_scan(session, scan, self._now(), failed=True)
+            status = alert_diagnostics.close_status_batch(session, scan, self._now())
+            if status is not None:
+                return status
+            raise
+        alert_diagnostics.finish_scan(session, scan, self._now())
+        if batch is not None:
+            return batch
+        return alert_diagnostics.close_status_batch(session, scan, self._now())
+
+    async def _create_proactive_stock_batch(
+        self, session: Session, batch_type: str, scan: dict,
+    ) -> RecommendationBatch | None:
         try:
             await self.refresh_always_on_state(session)
         except Exception:
-            pass
+            scan["listener_failed"] = True
+        llm = getattr(self.market_research, "llm", None)
+        if llm is not None:
+            llm.stock_analysis_mode = "not_run"
         ideas, news_briefs = await self.market_research.stock_report(
             session,
             stock_limit=self.settings.stock_proactive_idea_limit,
             news_limit=4,
         )
+        alert_diagnostics.capture_analysis(session, scan, self.market_research, self._now())
+        scan["reported_ideas"] = len(ideas)
         regular_market_hours = self._is_regular_market_hours()
-        actionable = [
-            idea
-            for idea in ideas
-            if self._is_proactive_actionable(idea)
-            and (regular_market_hours or self._is_after_hours_exception(idea))
-            and not self._recent_alert_exists(session, idea)
-        ]
+        actionable = []
+        rejected = scan["notification_rejections"]
+        for idea in ideas:
+            if not self._is_proactive_actionable(idea):
+                reason = "hold_watch" if idea.side in {"hold", "watch"} else "action_threshold"
+            elif not regular_market_hours and not self._is_after_hours_exception(idea):
+                reason = "after_hours"
+            elif self._recent_alert_exists(session, idea):
+                reason = "cooldown"
+            else:
+                actionable.append(idea)
+                continue
+            rejected[reason] = rejected.get(reason, 0) + 1
+        scan["eligible_ideas"] = len(actionable)
         if not actionable:
             return None
         batch = RecommendationBatch(batch_type=batch_type)
@@ -900,6 +934,7 @@ class StockAdvisorService:
                 )
             )
         session.commit()
+        scan["alert_batch_created"] = True
         return batch
 
 

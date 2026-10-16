@@ -59,7 +59,7 @@ async def test_llm_paces_and_reserves_market_budget(monkeypatch, hour, used_offh
     market.cache = SimpleNamespace(get_json=lambda *a, **kw: None,
         get_json_stale=lambda s,p,k: state.get(k), set_json=lambda s,p,k,v: state.update({k:v}))
     market.llm = SimpleNamespace(stock_analysis_mode="gemini", _stock_retry_after=None,
-        analyze_stocks=AsyncMock(return_value=[]), _fallback_stock_decisions=lambda p: [])
+        configured=lambda: True, analyze_stocks=AsyncMock(return_value=[]), _fallback_stock_decisions=lambda p: [])
     await market._stock_decisions(None, [{"symbol": "XOM"}])
     assert market.llm.analyze_stocks.await_count == expected_calls
 

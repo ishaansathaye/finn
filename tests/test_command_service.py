@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import os
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import AsyncMock
 
 TEST_DIRECTORY = TemporaryDirectory(prefix="finn-tests-")
 TEST_DATABASE = Path(TEST_DIRECTORY.name) / "test.db"
@@ -15,6 +17,7 @@ import pytest
 from sqlmodel import delete
 
 from app.command_service import CommandService
+from app.adapters.robinhood_prediction import RobinhoodCatalogSnapshot
 from app.db import get_session, init_db
 from app.models import (
     Account,
@@ -159,10 +162,27 @@ async def test_agent_command_renders_read_only_agentic_snapshot() -> None:
     assert "Codex available: True" in response
 
 
+def _mock_empty_event_account(monkeypatch: pytest.MonkeyPatch, service: CommandService) -> None:
+    adapter = service.recommendations.market_research.robinhood_prediction
+    snapshot = RobinhoodCatalogSnapshot(
+        events=[], event_states={}, quotes={}, fundamentals={}, navigation_nodes=[],
+        loaded_at=datetime(2030, 1, 1, tzinfo=UTC),
+    )
+    # Exercise account sync and watch refresh without broker auth, caches, or I/O.
+    monkeypatch.setattr(adapter, "configured", lambda: True)
+    monkeypatch.setattr(adapter, "get_event_contract_account", AsyncMock(return_value={"id": "test-event-account"}))
+    monkeypatch.setattr(adapter, "get_catalog_snapshot", AsyncMock(return_value=snapshot))
+    monkeypatch.setattr(adapter, "list_event_positions", AsyncMock(return_value=[]))
+    monkeypatch.setattr(adapter, "list_event_orders", AsyncMock(return_value=[]))
+    monkeypatch.setattr(adapter, "list_cash_settlement_executions", AsyncMock(return_value=[]))
+    monkeypatch.setattr(adapter, "get_marketdata_quotes", AsyncMock(return_value={}))
+
+
 @pytest.mark.asyncio
 async def test_report_and_execute_flow(monkeypatch: pytest.MonkeyPatch) -> None:
     bot = TelegramBot()
     service = CommandService(bot)
+    _mock_empty_event_account(monkeypatch, service)
 
     async def fake_top_stock_ideas(session, limit=7):  # noqa: ANN001
         return [
@@ -382,6 +402,12 @@ async def test_report_and_execute_flow(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_deny_and_betstats_flow(monkeypatch: pytest.MonkeyPatch) -> None:
     bot = TelegramBot()
     service = CommandService(bot)
+    _mock_empty_event_account(monkeypatch, service)
+
+    async def fake_quote_map(session, symbols):  # noqa: ANN001
+        return {symbol: {"symbol": symbol, "close": 100.0} for symbol in symbols}
+
+    monkeypatch.setattr(service.recommendations.market_research, "quote_map", fake_quote_map)
 
     async def fake_top_stock_ideas(session, limit=7):  # noqa: ANN001
         return []
@@ -738,6 +764,7 @@ async def test_plain_y_approves_latest_pending_position_alert(monkeypatch: pytes
 async def test_event_scout_suppresses_low_conviction_new_bets(monkeypatch: pytest.MonkeyPatch) -> None:
     bot = TelegramBot()
     service = CommandService(bot)
+    _mock_empty_event_account(monkeypatch, service)
 
     async def fake_refresh(session):  # noqa: ANN001
         return None
@@ -781,6 +808,7 @@ async def test_event_scout_suppresses_low_conviction_new_bets(monkeypatch: pytes
 async def test_event_scout_allows_high_conviction_new_bets(monkeypatch: pytest.MonkeyPatch) -> None:
     bot = TelegramBot()
     service = CommandService(bot)
+    _mock_empty_event_account(monkeypatch, service)
 
     async def fake_refresh(session):  # noqa: ANN001
         return None

@@ -18,6 +18,7 @@ from app.models import EventBetOutcome, EventDecisionSnapshot, EventPosition, Ev
 from app.services.market_research import MarketResearchService
 from app.services.portfolio_sync import PortfolioSyncService
 from app.services.stock_advisor import StockAdvisorService
+from app.services.stock_alert_diagnostics import STATUS_TYPE, status_messages
 
 
 SERIES_CODE_MAPS: dict[str, dict[str, str]] = {
@@ -605,6 +606,8 @@ class RecommendationService:
         batch = session.get(RecommendationBatch, batch_id)
         if batch is None:
             return ["No batch found."]
+        if batch.batch_type == STATUS_TYPE:
+            return status_messages(session, batch, datetime.now(UTC))
         if batch.batch_type in {"gx", "gx-live", "small-event"}:
             return [await self.format_gx_batch(session, batch_id)]
         if batch.batch_type == "event-control-auto":
@@ -3686,7 +3689,9 @@ class RecommendationService:
         return "\n".join(lines)
 
     def latest_batch(self, session: Session) -> RecommendationBatch | None:
-        stmt = select(RecommendationBatch).order_by(RecommendationBatch.created_at.desc())
+        stmt = select(RecommendationBatch).where(
+            RecommendationBatch.batch_type != STATUS_TYPE,
+        ).order_by(RecommendationBatch.created_at.desc())
         return session.exec(stmt).first()
 
     def batch_for_report_message(
