@@ -37,7 +37,7 @@ from app.models import (
 from app.services.llm_analysis import LLMAnalysisService, StockDecisionModel
 from app.services.market_cache import MarketCacheService
 from app.services.sec_research import SECResearchService
-from app.services.stock_evidence import article_evidence, balanced_shortlist, evidence_gaps, news_evidence, risk_metrics
+from app.services.stock_evidence import article_evidence, balanced_shortlist, core_pullback, evidence_gaps, news_evidence, risk_metrics
 
 
 ETF_SYMBOLS = {"SPY", "VOO", "VTI", "VT", "QQQ", "QQQM", "IVV", "DIA", "IWM"}
@@ -66,6 +66,7 @@ class StockIdea:
     source_status: str = "live"
     priority_score: float = 0.0
     confidence: str = "medium"
+    core_pullback: str = ""
 
 
 @dataclass
@@ -165,8 +166,9 @@ class MarketResearchService:
 
     def _priority_stock_universe(self, session: Session) -> list[str]:
         ranked_holdings = sorted(self._primary_holdings(session), key=lambda row: row.market_value, reverse=True)
-        prioritized: list[str] = []
-        seen: set[str] = set()
+        prioritized = list(dict.fromkeys(s.strip().upper() for s in (getattr(self.settings, "core_stock_symbols", "") or "").split(",") if s.strip()))
+        prioritized = prioritized[:max(1, self.settings.llm_max_stock_symbols // 4)]
+        seen = set(prioritized)
 
         holding_limit = max(8, self.settings.llm_max_stock_symbols // 2)
         for holding in ranked_holdings[:holding_limit]:
@@ -859,6 +861,8 @@ class MarketResearchService:
                 history_map[symbol] = history_payload
 
         triaged: list[tuple[float, str, dict[str, Any]]] = []
+        core = {s.strip().upper() for s in (getattr(self.settings, "core_stock_symbols", "") or "").split(",") if s.strip()}
+        scan_time = datetime.now(UTC)
         for symbol in universe:
             quote = raw_quotes.get(symbol) or {}
             close = float(quote.get("close") or 0.0)
@@ -879,6 +883,7 @@ class MarketResearchService:
                     symbol,
                     {
                         "quote": quote,
+                        "core_pullback": core_pullback(quote, history_map.get(symbol) or [], scan_time) if symbol in core else "",
                         "history_metrics": history_metrics,
                         "trend_score": trend_score,
                         "trend_reasons": trend_reasons,
@@ -891,7 +896,9 @@ class MarketResearchService:
 
         triaged.sort(key=lambda item: item[0], reverse=True)
         from app.services.stock_advisor import StockAdvisorService
-        shortlist = balanced_shortlist(triaged, self.settings.llm_max_stock_symbols, StockAdvisorService(self).sector_for_symbol)
+        core_ranked = sorted((row for row in triaged if row[1] in core), key=lambda row: not row[2]["core_pullback"])
+        shortlist = balanced_shortlist(triaged, self.settings.llm_max_stock_symbols, StockAdvisorService(self).sector_for_symbol,
+                                       [row[1] for row in core_ranked])
         shortlist_symbols = [item[1] for item in shortlist]
         shortlist_context = {symbol: context for _score, symbol, context in shortlist}
 
@@ -980,6 +987,7 @@ class MarketResearchService:
                     "symbol": symbol,
                     "company_name": sec_context.get("company_name") or symbol,
                     "currently_held": bool(holding),
+                    "core_pullback": context["core_pullback"],
                     "holding_value": round(holding.market_value, 2) if holding else 0.0,
                     "holding_weight": round(weight, 4),
                     "quantity": holding.quantity if holding else 0.0,
@@ -1100,6 +1108,7 @@ class MarketResearchService:
                     source_status=packet["quote_source"],
                     priority_score=priority_score,
                     confidence=decision.confidence,
+                    core_pullback=packet.get("core_pullback", ""),
                 )
             )
 
@@ -1107,6 +1116,11 @@ class MarketResearchService:
         self._rebalance_add_sizes(session, ideas, packet_map)
         from app.services.stock_strategy import apply_portfolio_strategy
         strategy = await apply_portfolio_strategy(self, session, ideas, history_map, benchmark_history)
+        for idea in ideas:
+            if idea.core_pullback:
+                if idea.side == "hold":
+                    idea.side, idea.amount_usd = "watch", 0.0
+                idea.reason = f"Core pullback: {idea.core_pullback}. {idea.reason}"
         ideas.sort(key=lambda item: item.priority_score, reverse=True)
         evidence_snapshot = {
             "as_of": now.isoformat(), "analysis_mode": self.llm.stock_analysis_mode,
@@ -1130,8 +1144,17 @@ class MarketResearchService:
 
         now = datetime.now(UTC)
         context = self._portfolio_context(session)
-        fingerprint = analysis_fingerprint(context, packets, self.settings.gemini_model_analyst)
         health = self.cache.get_json_stale(session, "stock_intelligence", "llm_health") or {}
+        primary = getattr(self.settings, "stock_gemini_model", None) or self.settings.gemini_model_analyst
+        model = primary
+        breaker = health.get("primary_unavailable") or {}
+        if breaker.get("model") == primary:
+            try:
+                if datetime.fromisoformat(breaker["until"]) > now:
+                    model = self.settings.gemini_model_analyst
+            except (KeyError, ValueError, TypeError):
+                pass
+        fingerprint = analysis_fingerprint(context, packets, model)
         budget_day = now.date().isoformat()
         used = int(health.get("requests_today") or 0) if health.get("budget_day") == budget_day else 0
 
@@ -1142,6 +1165,7 @@ class MarketResearchService:
                 "budget_timezone": "UTC", "requests_today": used,
                 "request_limit": self.settings.stock_llm_daily_request_budget,
                 "packet_count": len(packets), "next_request_at": next_request_at,
+                "model": model,
             })
             return decisions
 
@@ -1179,21 +1203,27 @@ class MarketResearchService:
             last_request = None
         if last_request is not None and last_request.tzinfo is None:
             last_request = last_request.replace(tzinfo=UTC)
-        interval = 2700 if market_window else 14400
+        interval = 60 * getattr(self.settings, "stock_llm_market_interval_minutes", 45) if market_window else 14400
+        offhours_limit = min(2, max(1, self.settings.stock_llm_daily_request_budget // 6))
         if ((last_request is not None and (now-last_request).total_seconds() < interval)
-                or (not market_window and offhours_used >= max(1, self.settings.stock_llm_daily_request_budget // 6))):
+                or (not market_window and offhours_used >= offhours_limit)):
             mode = "rules_only_request_spacing" if market_window else "rules_only_market_reserve"
             next_at = (last_request + timedelta(seconds=interval)).isoformat() if last_request else None
             # An off-hours cap may last beyond the spacing window; do not promise an early request.
-            if not market_window and offhours_used >= max(1, self.settings.stock_llm_daily_request_budget // 6):
+            if not market_window and offhours_used >= offhours_limit:
                 next_at = None
             return finish(self.llm._fallback_stock_decisions(packets), mode, next_at)
         # Reserve before the request so a timeout cannot bypass the persisted budget.
         state = {"checked_at": now.isoformat(), "last_request_at": now.isoformat(), "budget_day": now.date().isoformat(),
-                 "requests_today": used + 1, "requests_offhours": offhours_used + int(not market_window)}
+                 "requests_today": used + 1, "requests_offhours": offhours_used + int(not market_window),
+                 "model": model, "primary_unavailable": breaker if model != primary else {}}
         used += 1
         self.cache.set_json(session, "stock_intelligence", "llm_health", state)
-        decisions = await self.llm.analyze_stocks(portfolio_context=context, stock_packets=packets)
+        overrides = {"model_override": model} if model != primary else {}
+        decisions = await self.llm.analyze_stocks(portfolio_context=context, stock_packets=packets, **overrides)
+        if (model == primary and primary != self.settings.gemini_model_analyst
+                and getattr(self.llm, "stock_provider_status", None) in (404, 502, 503, 504)):
+            state["primary_unavailable"] = {"model": primary, "until": (now + timedelta(hours=2)).isoformat()}
         retry_at = getattr(self.llm, "_stock_retry_after", None)
         state.update({"mode": self.llm.stock_analysis_mode, "retry_after": retry_at.isoformat() if retry_at else None})
         self.cache.set_json(session, "stock_intelligence", "llm_health", state)

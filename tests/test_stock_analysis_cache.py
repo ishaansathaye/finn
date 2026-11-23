@@ -380,3 +380,44 @@ async def test_budget_day_is_utc_across_dst_and_local_midnight(harness, before, 
                                     datetime.min.time(), tzinfo=UTC)
         assert state(harness, "llm_scan")["next_request_at"] == reset_at.isoformat()
         assert_scan(harness, "rules_only_daily_budget", 12)
+@pytest.mark.asyncio
+async def test_stock_only_model_and_twenty_minute_spacing(harness):
+    harness.settings.stock_llm_market_interval_minutes = 20
+    harness.settings.stock_gemini_model = "stock-only-fixture"
+    market = harness.make_market()
+    await market._stock_decisions(None, harness.packets)
+    harness.packets[0]["core_pullback"] = "3.5% below the previous close"
+    harness.clock.now += timedelta(minutes=19)
+    await market._stock_decisions(None, harness.packets)
+    assert_scan(harness, "rules_only_request_spacing", 1)
+    harness.clock.now += timedelta(minutes=1)
+    await market._stock_decisions(None, harness.packets)
+    assert_scan(harness, "gemini", 2)
+    assert state(harness, "llm_scan")["model"] == "stock-only-fixture"
+@pytest.mark.asyncio
+async def test_capacity_outage_routes_next_eligible_scan_to_prior_model_without_extra_request(harness):
+    harness.settings.stock_gemini_model = "new-model"
+    harness.settings.stock_llm_market_interval_minutes = 20
+    market = harness.make_market()
+    async def fail(**kw):
+        market.llm.stock_provider_status = 503
+        market.llm.stock_analysis_mode = "rules_only_provider_error"
+        return market.llm._fallback_stock_decisions(kw["stock_packets"])
+    market.llm.analyze_stocks.side_effect = fail
+    await market._stock_decisions(None, harness.packets)
+    assert_scan(harness, "rules_only_provider_error", 1)
+    harness.clock.now += timedelta(minutes=21)
+    restarted = harness.make_market()
+    async def recover(**kw):
+        assert kw["model_override"] == harness.settings.gemini_model_analyst
+        restarted.llm.stock_analysis_mode = "gemini"
+        return [StockDecisionModel(symbol="SYNTH", action="watch", thesis_summary="Wait")]
+    restarted.llm.analyze_stocks.side_effect = recover
+    await restarted._stock_decisions(None, harness.packets)
+    assert_scan(harness, "gemini", 2)
+    assert state(harness, "llm_scan")["model"] == harness.settings.gemini_model_analyst
+    harness.clock.now += timedelta(hours=2)
+    retry = harness.make_market()
+    await retry._stock_decisions(None, harness.packets)
+    assert "model_override" not in retry.llm.analyze_stocks.await_args.kwargs
+    assert_scan(harness, "gemini", 3)

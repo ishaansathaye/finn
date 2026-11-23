@@ -20,10 +20,15 @@ class YFinanceAdapter:
             try:
                 ticker = yf.Ticker(symbol)
                 fast_info = ticker.fast_info
+                try:
+                    metadata = ticker.history_metadata or {}
+                except Exception:
+                    metadata = {}
                 payload[symbol] = {
                     "symbol": symbol,
-                    "close": fast_info.get("lastPrice"),
-                    "previous_close": fast_info.get("previousClose"),
+                    "close": metadata.get("regularMarketPrice") or fast_info.get("lastPrice"),
+                    "timestamp": metadata.get("regularMarketTime") if metadata.get("regularMarketPrice") else None,
+                    "previous_close": fast_info.get("regularMarketPreviousClose") or fast_info.get("previousClose"),
                     "high": fast_info.get("dayHigh"),
                     "low": fast_info.get("dayLow"),
                     "year_high": fast_info.get("yearHigh"),

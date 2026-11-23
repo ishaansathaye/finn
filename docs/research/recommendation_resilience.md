@@ -50,3 +50,22 @@ The close-window scheduler uses weekdays, not a full holiday/early-close exchang
 calendar. A stopped process cannot send its own quiet-day status; external
 monitoring remains a separate deployment concern. Some work in the main poller
 is sequential, so slow providers can delay later checks.
+
+## Core holding pullbacks
+
+Configured core symbols get a bounded share of detailed research slots (up to
+one quarter). The remaining slots continue to use ranking and sector coverage.
+A fresh current-session price at least 3% below the prior close or 7% below the
+highest close in the previous 20 sessions prompts a thesis review. Price is
+not evidence that a rebound will follow. Normal evidence, sizing, recent-buy
+and portfolio-risk checks still apply. A regular-session informational watch
+has no trade size and is deduplicated per symbol and trading date. Actionable
+buys can still alert after a watch.
+
+`STOCK_GEMINI_MODEL` overrides the analyst for stocks only. The daily request
+cap and market-window interval are configurable. Off-hours calls are limited
+to at most two per UTC budget day. The deterministic research path remains
+available during quota exhaustion or provider outages.
+If the stock-specific model is unavailable, the next eligible batch uses the
+existing analyst for up to two hours before retrying the primary. This does
+not create a second request in the same scan or bypass a quota response.

@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import math
 import re
+from datetime import UTC, date, datetime
 from statistics import stdev
+from zoneinfo import ZoneInfo
 
 
 def article_evidence(item: dict) -> tuple[float, list[str], list[str]]:
@@ -68,9 +70,47 @@ def risk_metrics(history: list[dict]) -> dict:
     }
 
 
-def balanced_shortlist(ranked: list[tuple], limit: int, sector_for_symbol) -> list[tuple]:
+def core_pullback(quote: dict, history: list[dict], now: datetime) -> str:
+    """Only flag a dip on a timestamped current-session quote, never on a cached prior close."""
+    if quote.get("source_status") not in {"twelve_data", "yfinance", "cache"}:
+        return ""
+    eastern = ZoneInfo("America/New_York")
+    today = now.astimezone(eastern).date()
+    try:
+        stamp = datetime.fromtimestamp(float(quote.get("last_quote_at") or quote["timestamp"]), UTC)
+        price, prior = float(quote["close"]), float(quote["previous_close"])
+        if not all(math.isfinite(p) and p > 0 for p in (price, prior)):
+            return ""
+    except (ValueError, KeyError, TypeError, OverflowError, OSError):
+        return ""
+    age = (now - stamp).total_seconds()
+    if not 0 <= age <= 3600 or stamp.astimezone(eastern).date() != today:
+        return ""
+    session_loss = 100 * (1 - price / prior)
+    moves = [f"{session_loss:.1f}% below the previous close"] if session_loss >= 3 - 1e-9 else []
+    closes = {}
+    for row in history:
+        try:
+            day = date.fromisoformat(str(row["datetime"])[:10])
+            close = float(row["close"])
+        except (ValueError, TypeError, KeyError):
+            continue
+        if day < today and (today - day).days <= 40 and math.isfinite(close) and close > 0:
+            closes[day] = close
+    days = sorted(closes)[-20:]
+    if len(days) == 20 and (today - days[-1]).days <= 5:
+        drawdown = 100 * (1 - price / max(closes[day] for day in days))
+        if drawdown >= 7 - 1e-9:
+            moves.append(f"{drawdown:.1f}% below the prior 20-session closing high")
+    return " and ".join(moves)
+
+
+def balanced_shortlist(ranked: list[tuple], limit: int, sector_for_symbol, priority_symbols=()) -> list[tuple]:
     """Reserve half the slots for strongest names, then cover distinct sectors."""
-    selected = list(ranked[: max(1, limit // 2)])
+    by_symbol = {item[1]: item for item in ranked}
+    selected = [by_symbol[s] for s in dict.fromkeys(priority_symbols) if s in by_symbol][:max(1, limit // 4)]
+    reserved = {item[1] for item in selected}
+    selected += [item for item in ranked if item[1] not in reserved][:max(0, max(1, limit // 2) - len(selected))]
     seen = {item[1] for item in selected}
     sectors = {sector_for_symbol(item[1]) for item in selected}
     for item in ranked:

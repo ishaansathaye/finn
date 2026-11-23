@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from html import escape
 import hashlib
@@ -744,11 +745,16 @@ class StockAdvisorService:
         return selected
 
     def _stock_alert_state_key(self, idea: StockIdea) -> str:
+        if idea.side == "watch" and idea.core_pullback:
+            session_day = self._now().replace(tzinfo=UTC).astimezone(ZoneInfo("America/New_York")).date()
+            return f"{idea.symbol}:core_pullback:{session_day}"
         amount_bucket = round(float(idea.amount_usd or 0.0) / 25.0) * 25
         return f"{idea.symbol}:{idea.side}:{amount_bucket}"
 
     def _recent_alert_exists(self, session: Session, idea: StockIdea) -> bool:
         key = self._stock_alert_state_key(idea)
+        if idea.side == "watch" and idea.core_pullback:
+            return session.exec(select(StockAlert.id).where(StockAlert.alert_key == key)).first() is not None
         cutoff = self._now() - timedelta(minutes=self.settings.stock_alert_cooldown_minutes)
         exact_row = session.exec(
             select(StockAlert).where(StockAlert.alert_key == key, StockAlert.created_at >= cutoff)
@@ -765,6 +771,8 @@ class StockAdvisorService:
         return symbol_row is not None
 
     def _is_proactive_actionable(self, idea: StockIdea) -> bool:
+        if idea.side == "watch":
+            return bool(idea.core_pullback) and idea.symbol in self._core_symbols() and idea.amount_usd == 0
         if idea.side == "sell":
             return float(idea.amount_usd or 0.0) > 0
         if idea.side == "buy":
@@ -827,7 +835,7 @@ class StockAdvisorService:
             llm.stock_analysis_mode = "not_run"
         ideas, news_briefs = await self.market_research.stock_report(
             session,
-            stock_limit=self.settings.stock_proactive_idea_limit,
+            stock_limit=max(self.settings.stock_proactive_idea_limit, getattr(self.settings, "llm_max_stock_symbols", 0)),
             news_limit=4,
         )
         alert_diagnostics.capture_analysis(session, scan, self.market_research, self._now())
@@ -836,6 +844,10 @@ class StockAdvisorService:
         actionable = []
         rejected = scan["notification_rejections"]
         for idea in ideas:
+            if (regular_market_hours and idea.side == "buy" and idea.core_pullback
+                    and not self._is_proactive_actionable(idea)):
+                idea = replace(idea, side="watch", amount_usd=0.0,
+                               reason=f"Core pullback: {idea.core_pullback}. No buy alert: confidence or sizing did not meet the entry threshold.")
             if not self._is_proactive_actionable(idea):
                 reason = "hold_watch" if idea.side in {"hold", "watch"} else "action_threshold"
             elif not regular_market_hours and not self._is_after_hours_exception(idea):
@@ -849,6 +861,12 @@ class StockAdvisorService:
         scan["eligible_ideas"] = len(actionable)
         if not actionable:
             return None
+        # Trades take precedence. Reserve at most one slot for an informational dip.
+        trades = [idea for idea in actionable if idea.side != "watch"]
+        watches = [idea for idea in actionable if idea.side == "watch"]
+        limit = self.settings.stock_proactive_idea_limit
+        include_watch = watches and (limit > 1 or not trades)
+        actionable = trades[:limit - int(bool(include_watch))] + (watches[:1] if include_watch else [])
         batch = RecommendationBatch(batch_type=batch_type)
         session.add(batch)
         session.commit()
@@ -870,7 +888,7 @@ class StockAdvisorService:
                 amount_usd=round(float(idea.amount_usd or 0.0), 2),
                 reason=reason,
                 risk=idea.risk,
-                execution_mode="manual",
+                execution_mode="none" if idea.side == "watch" else "manual",
                 valid_until=validity,
             )
             session.add(rec)

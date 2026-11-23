@@ -266,6 +266,7 @@ def test_upgrade_link_never_substitutes_missing_approval():
 
 def test_cli_requested_symbol_failure_is_nonzero(monkeypatch, capsys):
     cli = _cli_module()
+    monkeypatch.setattr(cli, "build_report", lambda *a, **kw: build_report(*a, now=NOW, **kw))
     client = symbol_client()
     client.responses["get_option_quotes"] = RuntimeError(SECRET)
     monkeypatch.setattr("sys.argv", ["print_options_readiness", "--symbol", "AAPL"])

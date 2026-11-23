@@ -224,3 +224,36 @@ async def test_hidden_holds_do_not_crowd_out_visible_report():
     service._position_map = lambda session: {}
     visible, _ = await service.stock_report(None, stock_limit=1)
     assert [idea.symbol for idea in visible] == ["XOM"]
+def test_core_shortlist_preserves_core_review_and_other_sectors():
+    from app.services.stock_evidence import balanced_shortlist
+    rows = [(10-i, sym, {}) for i, sym in enumerate(("A", "B", "C", "D", "E", "F", "CORE"))]
+    picked = balanced_shortlist(rows, 4, lambda s: {"A":"tech", "B":"tech", "C":"energy"}.get(s, s), ["CORE"])
+    assert [r[1] for r in picked] == ["CORE", "A", "C", "D"]
+
+
+def test_core_dip_uses_current_timestamp_and_prior_sessions_only():
+    from datetime import UTC, datetime, timedelta
+    from app.services.stock_evidence import core_pullback
+    now = datetime(2026, 10, 19, 16, tzinfo=UTC)
+    quote = {"source_status":"cache", "close":97, "previous_close":100, "timestamp":now.timestamp()}
+    assert "3.0%" in core_pullback(quote, [], now)
+    for q in (dict(quote, source_status="stale_cache"), dict(quote, timestamp=0),
+              dict(quote, close=float("nan")), dict(quote, timestamp=(now+timedelta(hours=1)).timestamp())):
+        assert not core_pullback(q, [], now)
+    bars = [{"datetime":str((now-timedelta(days=d)).date()), "close":100} for d in range(1,32)
+            if (now-timedelta(days=d)).weekday()<5]
+    q = dict(quote, close=93, previous_close=94)
+    assert "7.0%" in core_pullback(q, bars, now)
+    assert not core_pullback(q, bars[:19], now)
+    future = [{"datetime":str((now+timedelta(days=d)).date()), "close":999} for d in (0,1)]
+    assert not core_pullback(dict(q, close=99, previous_close=99), bars+future, now)
+def test_stock_brief_retains_pullback_filing_risks_and_dated_facts_without_raw_history():
+    from app.services.llm_analysis import stock_model_brief
+    packet = {"symbol":"CORE", "core_pullback":"8% below peak", "holding_weight":0.14,
+              "fundamentals":{"quarterly":{"raw":[1]*1000}, "trend_summary":{"eps_growth_yoy_pct":3}},
+              "recent_filings":[{"form_type":"8-K", "filing_date":"2026-03-06", "risk_flags":["guidance cut"], "excerpt":"x"*1000}]}
+    brief = stock_model_brief(packet)
+    assert brief["core_pullback"] == packet["core_pullback"] and brief["holding_weight"] == .14
+    assert brief["fundamentals"] == {"trend_summary":{"eps_growth_yoy_pct":3}}
+    assert brief["recent_filings"][0]["risk_flags"] == ["guidance cut"]
+    assert "excerpt" not in brief["recent_filings"][0] and "quarterly" in packet["fundamentals"]

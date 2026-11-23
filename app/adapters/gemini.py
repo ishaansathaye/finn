@@ -31,7 +31,7 @@ class GeminiAdapter:
             raise RuntimeError("Gemini API key is not configured")
 
         url = f"{self.base_url}/models/{model}:generateContent"
-        params = {"key": self.settings.gemini_api_key}
+        headers = {"x-goog-api-key": self.settings.gemini_api_key}
         payload = {
             "system_instruction": {
                 "parts": [{"text": system_instruction}],
@@ -50,7 +50,7 @@ class GeminiAdapter:
         if thinking_budget is not None and model.startswith("gemini-2.5-flash"):
             payload["generationConfig"]["thinkingConfig"] = {"thinkingBudget": thinking_budget}
         async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds, connect=10)) as client:
-            response = await client.post(url, params=params, json=payload)
+            response = await client.post(url, headers=headers, json=payload)
             response.raise_for_status()
             data = response.json()
         text = self._extract_text(data)

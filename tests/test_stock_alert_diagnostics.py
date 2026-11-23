@@ -287,3 +287,22 @@ async def test_listener_failure_does_not_suppress_diagnostic_or_other_analysis(s
     batch = await advisor.create_proactive_stock_batch(session)
     assert scans(session)[0]["listener_failed"] is True
     assert "News/filing refresh failed" in diagnostics.status_messages(session, batch, CLOSE)[0]
+@pytest.mark.asyncio
+async def test_core_pullback_watch_is_nontrading_daily_and_does_not_block_later_buy(session):
+    from dataclasses import replace
+    now = CLOSE.replace(hour=17)
+    dip = replace(idea("buy"), symbol="VTI", core_pullback="3.2% below the previous close")
+    advisor = advisor_at(now=now, ideas=[dip])
+    advisor.settings.llm_max_stock_symbols = 24
+    batch = await advisor.create_proactive_stock_batch(session)
+    row = session.exec(select(Recommendation).where(Recommendation.batch_id == batch.id)).one()
+    assert (row.side, row.amount_usd, row.execution_mode) == ("watch", 0, "none")
+    assert "3.2%" in row.reason
+    assert advisor.market_research.stock_report.await_args.kwargs["stock_limit"] == 24
+    assert await advisor.create_proactive_stock_batch(session) is None
+    dip.confidence = "high"
+    assert await advisor.create_proactive_stock_batch(session) is not None
+    dip.confidence = "medium"
+    close_batch = await advisor_at(now=CLOSE, ideas=[dip]).create_proactive_stock_batch(session)
+    assert close_batch is None or not session.exec(select(Recommendation).where(Recommendation.batch_id == close_batch.id)).all()
+    assert await advisor_at(now=now+timedelta(days=1), ideas=[dip]).create_proactive_stock_batch(session) is not None

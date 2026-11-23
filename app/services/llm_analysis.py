@@ -55,6 +55,23 @@ class AnalysisResult:
     events: list[EventDecisionModel]
 
 
+def stock_model_brief(packet: dict) -> dict:
+    """Keep dated evidence and risk inputs; leave raw SEC time series in the local research snapshot."""
+    brief = {k: v for k, v in packet.items() if k not in {"fundamentals", "news_headlines", "recent_filings", "recent_state"}}
+    facts = packet.get("fundamentals") or {}
+    brief["fundamentals"] = {k: v for k, v in facts.items() if k != "quarterly"}
+    brief["news_headlines"] = [
+        {k: str(item[k])[:180] for k in ("title", "published_at", "provider") if item.get(k)}
+        for item in (packet.get("news_headlines") or [])[:3] if isinstance(item, dict)
+    ]
+    brief["recent_filings"] = [
+        {k: item[k] for k in ("form_type", "filing_date", "signals", "risk_flags") if item.get(k)}
+        for item in (packet.get("recent_filings") or [])[:4] if isinstance(item, dict)
+    ]
+    brief["recent_state"] = {k: v for k, v in (packet.get("recent_state") or {}).items() if k != "recent_reason"}
+    return brief
+
+
 class LLMAnalysisService:
     _stock_cache: dict[str, tuple[datetime, list[StockDecisionModel]]] = {}
     _stock_retry_after: datetime | None = None
@@ -72,11 +89,14 @@ class LLMAnalysisService:
         *,
         portfolio_context: dict[str, Any],
         stock_packets: list[dict[str, Any]],
+        model_override: str | None = None,
     ) -> list[StockDecisionModel]:
+        self.stock_provider_status = None
         if not stock_packets:
             return []
         now = datetime.now(UTC)
-        cache_key = hashlib.sha256(json.dumps({"packets": stock_packets, "portfolio": portfolio_context}, sort_keys=True, default=str).encode()).hexdigest()
+        model = model_override or getattr(self.settings, "stock_gemini_model", None) or self.settings.gemini_model_analyst
+        cache_key = hashlib.sha256(json.dumps({"model": model, "packets": stock_packets, "portfolio": portfolio_context}, sort_keys=True, default=str).encode()).hexdigest()
         cached = self._stock_cache.get(cache_key)
         if cached and (now - cached[0]).total_seconds() < 900:
             self.stock_analysis_mode = "gemini_cached"
@@ -89,13 +109,15 @@ class LLMAnalysisService:
             return self._fallback_stock_decisions(stock_packets)
 
         payload = {
-            "portfolio_context": portfolio_context,
-            "stock_packets": stock_packets,
+            "portfolio_context": {k: v for k, v in portfolio_context.items() if k != "account_id"},
+            "stock_packets": [stock_model_brief(packet) for packet in stock_packets],
             "output_schema": StockAnalysisResponse.model_json_schema(),
             "task": (
                 "Classify each symbol as hold, add, reduce, exit, watch, or avoid. "
                 "Be conservative. Prefer hold when the thesis is intact and there is no strong new reason to change the position. "
                 "Do not recommend add when concentration is already high or risk penalties dominate. "
+                "For a core_pullback, assess whether underlying fundamentals and longer-term trend support adding. "
+                "A lower price alone is not a buy. Explain the strongest reason to add or wait. "
                 "Do not recommend reduce or exit without explicit risk or thesis deterioration. "
                 "For symbols not currently held, prefer add, watch, or avoid rather than hold. "
                 "Surface a small number of fresh candidates when evidence is strong enough. "
@@ -120,7 +142,7 @@ class LLMAnalysisService:
         )
         try:
             raw = await self.gemini.generate_json(
-                model=self.settings.gemini_model_analyst,
+                model=model,
                 system_instruction=system_instruction,
                 user_payload=payload,
                 temperature=0.15,
@@ -139,6 +161,7 @@ class LLMAnalysisService:
         except Exception as exc:
             response = getattr(exc, "response", None)
             status = getattr(response, "status_code", None)
+            self.stock_provider_status = status
             if status == 429:
                 # Persisting provider health at the caller also survives restarts.
                 delay = 3600
