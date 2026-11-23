@@ -42,6 +42,8 @@ def pytest_configure(config: pytest.Config) -> None:
     # An autouse fixture alone starts too late for collection or session setup.
     guard = pytest.MonkeyPatch()
     config.add_cleanup(guard.undo)
+    # Never let synthetic scans replace another service's production research feed.
+    guard.setenv("STOCK_RESEARCH_FEED_PATH", "")
     _install_network_guards(guard)
 
 
