@@ -29,6 +29,7 @@ from app.models import (
     StockUniverseMember,
 )
 from app.services.market_research import MarketResearchService, StockIdea
+from app.services.holding_horizon import protect_long_hold, sell_cost_context
 from app.services import stock_alert_diagnostics as alert_diagnostics
 
 
@@ -80,7 +81,7 @@ class StockAdvisorService:
         if symbol == "TSLA":
             return "Consumer / Travel"
         sectors = {
-            "Space": {"RKLB", "LUNR", "ASTS", "IRDM", "VSAT", "ARKX"},
+            "Space": {"SPCX", "RKLB", "LUNR", "ASTS", "IRDM", "VSAT", "ARKX"},
             "Energy / Nuclear": {"XOM", "CVX", "COP", "EOG", "FANG", "OXY", "SLB", "LNG", "NEE", "VST", "CEG", "OKLO", "CCJ", "UEC", "URA"},
             "Defense / Aerospace": {"RTX", "LMT", "NOC", "GD", "HII", "KTOS", "AVAV", "GE", "BA", "ITA", "XAR"},
             "Tech / AI": {"NVDA", "AMD", "AVGO", "TSM", "MU", "MRVL", "ARM", "QCOM", "ANET", "DELL", "SMCI", "MSFT", "AMZN", "GOOGL", "GOOG", "META", "NFLX", "UBER", "CRM", "ORCL", "SNOW", "PLTR", "ADBE", "NOW", "CRWD", "NET", "DDOG", "PANW", "ZS", "SNDK", "APP", "TTD", "SHOP", "CSCO", "PENG", "SMH"},
@@ -745,6 +746,8 @@ class StockAdvisorService:
         return selected
 
     def _stock_alert_state_key(self, idea: StockIdea) -> str:
+        if idea.side == "sell" and idea.sell_thesis_key:
+            return f"{idea.symbol}:sell:{idea.sell_thesis_key}"
         if idea.side == "watch" and idea.core_pullback:
             session_day = self._now().replace(tzinfo=UTC).astimezone(ZoneInfo("America/New_York")).date()
             return f"{idea.symbol}:core_pullback:{session_day}"
@@ -753,7 +756,7 @@ class StockAdvisorService:
 
     def _recent_alert_exists(self, session: Session, idea: StockIdea) -> bool:
         key = self._stock_alert_state_key(idea)
-        if idea.side == "watch" and idea.core_pullback:
+        if (idea.side == "watch" and idea.core_pullback) or (idea.side == "sell" and idea.sell_thesis_key):
             return session.exec(select(StockAlert.id).where(StockAlert.alert_key == key)).first() is not None
         cutoff = self._now() - timedelta(minutes=self.settings.stock_alert_cooldown_minutes)
         exact_row = session.exec(
@@ -985,6 +988,7 @@ class StockAdvisorService:
         normalized = " ".join(query.upper().replace("$", "").split())
         aliases = {
             "NVIDIA": "NVDA", "NVIDIA CORP": "NVDA",
+            "SPACEX": "SPCX", "SPACE EXPLORATION TECHNOLOGIES": "SPCX", "SNOWFLAKE": "SNOW",
             "MARVELL": "MRVL", "MARVELL TECHNOLOGY": "MRVL",
             "SANDISK": "SNDK",
             "ROCKET LAB": "RKLB", "ROCKETLAB": "RKLB",
@@ -1040,9 +1044,10 @@ class StockAdvisorService:
             "symbol": symbol,
             "company_name": (sec or {}).get("company_name") or symbol,
             "currently_held": bool(holding),
+            "holding_lane": "confirmed_core" if symbol in self._core_symbols() else (policy.lane if policy else "unknown"),
             "holding_value": round(float(holding.market_value or 0.0), 2) if holding else 0.0,
             "holding_weight": round(self.market_research._holding_weight(session, symbol), 4),
-            "asset_class": "stock",
+            "asset_class": "etf" if self.market_research._is_etf(symbol, holding) else "stock",
             "close": close,
             "previous_close": prev,
             "momentum_pct": round(change_pct, 2),
@@ -1068,9 +1073,13 @@ class StockAdvisorService:
             stock_packets=[packet],
         )
         decision = decisions[0] if decisions else None
+        if decision:
+            protect_long_hold(decision, packet, self._now().date())
         action = decision.action.upper() if decision else ("WATCH" if composite > 0.8 else "AVOID")
         confidence = decision.confidence if decision else "medium"
         thesis = decision.thesis_summary if decision else self.market_research.llm._compact_stock_summary("watch", packet)
+        if decision and decision.action in {"exit", "reduce"}:
+            thesis = f"{thesis} {sell_cost_context(decision.action, holding)}"
         amount = 0.0
         if decision:
             amount = self.market_research._size_stock_decision(decision.action, decision.sizing_intent, packet, total_value=max(self.market_research._current_total_value(session), 1.0))

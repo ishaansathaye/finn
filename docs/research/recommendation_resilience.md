@@ -69,3 +69,19 @@ available during quota exhaustion or provider outages.
 If the stock-specific model is unavailable, the next eligible batch uses the
 existing analyst for up to two hours before retrying the primary. This does
 not create a second request in the same scan or bypass a quota response.
+
+## Long-horizon sales and independent research
+
+The hold policy applies before sizing in both the stock report and single-name
+research. Confirmed and inferred core positions default to hold when a proposed
+sale is based solely on price, portfolio weight or slower positive growth.
+A recent issuer insolvency filing can justify an exit; a high-confidence,
+dated sales and earnings contraction can justify a trim. A protected sell is
+alerted once per material filing and symbol. These are conservative heuristics,
+not a backtested claim of excess return. A held ETF is not evaluated as an
+operating company.
+
+An optional atomic market-only JSON export (`STOCK_RESEARCH_FEED_PATH`) lets
+an independent paper evaluator compare sectors. No holdings, account details,
+balances, trade sizes or broker instructions are exported. Stale quotes are
+excluded. Paper results are hypothetical, not broker fills.

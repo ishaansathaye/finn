@@ -16,7 +16,7 @@ def analysis_fingerprint(context: dict, packets: list[dict], model: str) -> str:
     evidence = []
     for packet in packets:
         row = {k: v for k, v in packet.items()
-               if k not in {"close", "momentum_pct", "holding_value", "holding_weight"}}
+               if k not in {"close", "momentum_pct", "holding_value", "holding_weight", "quote_timestamp"}}
         row["holding_weight"] = round(float(packet.get("holding_weight") or 0), 2)
         evidence.append(row)
     payload = {"version": 2, "model": model, "portfolio": portfolio,

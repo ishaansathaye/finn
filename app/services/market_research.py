@@ -5,6 +5,7 @@ import asyncio
 from datetime import UTC, date, datetime, timedelta
 from email.utils import parsedate_to_datetime
 import json
+import logging
 from math import floor, isfinite
 from math import log10
 import re
@@ -36,6 +37,8 @@ from app.models import (
 )
 from app.services.llm_analysis import LLMAnalysisService, StockDecisionModel
 from app.services.market_cache import MarketCacheService
+from app.services.holding_horizon import protect_long_hold, sell_cost_context
+from app.services.stock_research_feed import publish_research
 from app.services.sec_research import SECResearchService
 from app.services.stock_evidence import article_evidence, balanced_shortlist, core_pullback, evidence_gaps, news_evidence, risk_metrics
 
@@ -67,6 +70,7 @@ class StockIdea:
     priority_score: float = 0.0
     confidence: str = "medium"
     core_pullback: str = ""
+    sell_thesis_key: str = ""
 
 
 @dataclass
@@ -167,7 +171,7 @@ class MarketResearchService:
     def _priority_stock_universe(self, session: Session) -> list[str]:
         ranked_holdings = sorted(self._primary_holdings(session), key=lambda row: row.market_value, reverse=True)
         prioritized = list(dict.fromkeys(s.strip().upper() for s in (getattr(self.settings, "core_stock_symbols", "") or "").split(",") if s.strip()))
-        prioritized = prioritized[:max(1, self.settings.llm_max_stock_symbols // 4)]
+        prioritized = prioritized[:max(1, self.settings.stock_discovery_limit // 4)]
         seen = set(prioritized)
 
         holding_limit = max(8, self.settings.llm_max_stock_symbols // 2)
@@ -896,8 +900,11 @@ class MarketResearchService:
 
         triaged.sort(key=lambda item: item[0], reverse=True)
         from app.services.stock_advisor import StockAdvisorService
-        core_ranked = sorted((row for row in triaged if row[1] in core), key=lambda row: not row[2]["core_pullback"])
-        shortlist = balanced_shortlist(triaged, self.settings.llm_max_stock_symbols, StockAdvisorService(self).sector_for_symbol,
+        advisor = StockAdvisorService(self)
+        core_ranked = [row for row in triaged if row[1] in core]
+        offset = int(scan_time.timestamp() // 900) % max(1, len(core_ranked))
+        core_ranked = sorted(core_ranked[offset:] + core_ranked[:offset], key=lambda row: not row[2]["core_pullback"])
+        shortlist = balanced_shortlist(triaged, self.settings.llm_max_stock_symbols, advisor.sector_for_symbol,
                                        [row[1] for row in core_ranked])
         shortlist_symbols = [item[1] for item in shortlist]
         shortlist_context = {symbol: context for _score, symbol, context in shortlist}
@@ -982,12 +989,16 @@ class MarketResearchService:
                 2,
             )
             recent_state = self._recent_recommendation_state(session, symbol)
+            policy = advisor._policy_for_symbol(session, symbol) if holding else None
             stock_packets.append(
                 {
                     "symbol": symbol,
                     "company_name": sec_context.get("company_name") or symbol,
                     "currently_held": bool(holding),
                     "core_pullback": context["core_pullback"],
+                    "holding_lane": "confirmed_core" if symbol in core else (policy.lane if policy else "unknown"),
+                    "sector": advisor.sector_for_symbol(symbol),
+                    "quote_timestamp": quote.get("last_quote_at") or quote.get("timestamp"),
                     "holding_value": round(holding.market_value, 2) if holding else 0.0,
                     "holding_weight": round(weight, 4),
                     "quantity": holding.quantity if holding else 0.0,
@@ -1038,6 +1049,7 @@ class MarketResearchService:
             decision = decision_map.get(packet["symbol"])
             if not decision:
                 continue
+            sell_key = protect_long_hold(decision, packet, now.date())
             gaps = evidence_gaps(packet)
             if decision.action == "add" and (gaps or float(packet.get("trend_score") or 0) <= 0):
                 decision.action = "hold" if packet.get("currently_held") else "watch"
@@ -1066,6 +1078,9 @@ class MarketResearchService:
 
             risk = self._risk_from_decision(decision.confidence, decision.risk_flags, decision.action)
             summary_parts = [decision.thesis_summary]
+            cost_context = sell_cost_context(decision.action, position_map.get(packet["symbol"]))
+            if cost_context:
+                summary_parts.append(cost_context)
             why_line = str(packet.get("why_now") or "").strip()
             if not why_line and decision.key_reasons:
                 why_line = "; ".join(decision.key_reasons[:3])
@@ -1109,6 +1124,7 @@ class MarketResearchService:
                     priority_score=priority_score,
                     confidence=decision.confidence,
                     core_pullback=packet.get("core_pullback", ""),
+                    sell_thesis_key=sell_key,
                 )
             )
 
@@ -1130,6 +1146,10 @@ class MarketResearchService:
             "portfolio_strategy": strategy,
         }
         self.cache.set_json(session, "stock_intelligence", "latest", evidence_snapshot)
+        try:
+            publish_research(getattr(self.settings, "stock_research_feed_path", ""), stock_packets, now)
+        except OSError:
+            logging.getLogger(__name__).warning("Stock research export unavailable; local scan retained")
         # Bounded prospective samples, not a backtest reconstructed from future filings.
         samples = self.cache.get_json_stale(session, "stock_intelligence", "evaluation_samples") or []
         if not samples or (now - datetime.fromisoformat(samples[-1]["as_of"])).total_seconds() >= 1800:

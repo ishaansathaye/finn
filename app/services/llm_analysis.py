@@ -119,6 +119,8 @@ class LLMAnalysisService:
                 "For a core_pullback, assess whether underlying fundamentals and longer-term trend support adding. "
                 "A lower price alone is not a buy. Explain the strongest reason to add or wait. "
                 "Do not recommend reduce or exit without explicit risk or thesis deterioration. "
+                "For confirmed_core or probable_core, preserve the long-term holding absent verified issuer deterioration. "
+                "A gain, overweight position, technical dip or slower positive growth is not a reason to sell by itself. "
                 "For symbols not currently held, prefer add, watch, or avoid rather than hold. "
                 "Surface a small number of fresh candidates when evidence is strong enough. "
                 "Treat scores as uncalibrated rankings, not probabilities. Cross-check measured evidence. "

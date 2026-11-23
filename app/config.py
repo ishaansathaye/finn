@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     gemini_api_key: str | None = Field(default=None, alias="GEMINI_API_KEY")
     gemini_model_analyst: str = Field(default="gemini-2.5-flash", alias="GEMINI_MODEL_ANALYST")
     stock_gemini_model: str | None = Field(default=None, alias="STOCK_GEMINI_MODEL")
+    stock_research_feed_path: str = Field(default="", alias="STOCK_RESEARCH_FEED_PATH")
     stock_llm_market_interval_minutes: int = Field(default=45, ge=1, alias="STOCK_LLM_MARKET_INTERVAL_MINUTES")
     stock_llm_daily_request_budget: int = Field(default=12, ge=0, alias="STOCK_LLM_DAILY_REQUEST_BUDGET")
     stock_strategy_enabled: bool = Field(default=True, alias="STOCK_STRATEGY_ENABLED")
