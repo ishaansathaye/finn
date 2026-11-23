@@ -191,8 +191,8 @@ class StockAdvisorService:
                 .order_by(StockUniverseMember.confidence.desc(), StockUniverseMember.last_seen_at.desc())
             ).all()
         )
-        news_symbols = [row.symbol for row in session.exec(select(StockNewsItem).order_by(StockNewsItem.created_at.desc())).all()[:60]]
-        filing_symbols = [row.symbol for row in session.exec(select(StockFilingItem).order_by(StockFilingItem.created_at.desc())).all()[:60]]
+        news_symbols = session.exec(select(StockNewsItem.symbol).order_by(StockNewsItem.created_at.desc()).limit(60)).all()
+        filing_symbols = session.exec(select(StockFilingItem.symbol).order_by(StockFilingItem.created_at.desc()).limit(60)).all()
         symbols: list[str] = []
         seen: set[str] = set()
         for source in (

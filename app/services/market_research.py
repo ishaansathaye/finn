@@ -209,12 +209,12 @@ class MarketResearchService:
                 prioritized.append(symbol)
                 seen.add(symbol)
 
-        for symbol in [row.symbol for row in session.exec(select(StockNewsItem).order_by(StockNewsItem.created_at.desc())).all()[:80]]:
+        for symbol in session.exec(select(StockNewsItem.symbol).order_by(StockNewsItem.created_at.desc()).limit(80)):
             if symbol and symbol not in seen:
                 prioritized.append(symbol)
                 seen.add(symbol)
 
-        for symbol in [row.symbol for row in session.exec(select(StockFilingItem).order_by(StockFilingItem.created_at.desc())).all()[:80]]:
+        for symbol in session.exec(select(StockFilingItem.symbol).order_by(StockFilingItem.created_at.desc()).limit(80)):
             if symbol and symbol not in seen:
                 prioritized.append(symbol)
                 seen.add(symbol)
@@ -344,6 +344,7 @@ class MarketResearchService:
                     select(AccountSnapshot)
                     .where(AccountSnapshot.account_id == account.id)
                     .order_by(AccountSnapshot.as_of.desc())
+                    .limit(1)
                 ).first()
                 if snapshot is not None and snapshot.as_of >= datetime.now(UTC).replace(tzinfo=None) - timedelta(days=1):
                     return snapshot
@@ -359,6 +360,7 @@ class MarketResearchService:
                 select(AccountSnapshot)
                 .where(AccountSnapshot.account_id == account.id)
                 .order_by(AccountSnapshot.as_of.desc())
+                .limit(1)
             ).first()
             if snapshot is None or snapshot.as_of < datetime.now(UTC).replace(tzinfo=None) - timedelta(days=1):
                 continue
@@ -501,7 +503,7 @@ class MarketResearchService:
             .where(Recommendation.recommendation_type.in_(("stock", "etf")))
             .order_by(Recommendation.created_at.desc())
         )
-        recent = list(session.exec(stmt).all()[:5])
+        recent = list(session.exec(stmt.limit(5)).all())
         if not recent:
             return {
                 "recent_side": None,
@@ -850,6 +852,7 @@ class MarketResearchService:
 
         raw_quotes = await self.quote_map(session, universe)
         position_map = self._position_map(session)
+        scan_nav = self._current_total_value(session)
         benchmark_history = await self._get_history(session, "SPY")
         benchmark_metrics = self._history_metrics(benchmark_history)
 
@@ -877,7 +880,7 @@ class MarketResearchService:
             history_metrics.update(risk_metrics(history_map.get(symbol) or []))
             trend_score, trend_reasons, trend_risks = self._trend_signal(history_metrics, benchmark_metrics)
             holding = position_map.get(symbol)
-            weight = self._holding_weight(session, symbol)
+            weight = holding.market_value / scan_nav if holding and scan_nav > 0 else 0.0
             triage_bonus = 1.0 if holding else 0.0
             if symbol in self.settings.starter_symbols:
                 triage_bonus += 0.25

@@ -899,6 +899,7 @@ async def test_stock_report_excludes_employer_symbol(monkeypatch: pytest.MonkeyP
 async def test_stock_alert_suppresses_routine_after_hours(monkeypatch: pytest.MonkeyPatch) -> None:
     bot = TelegramBot()
     service = CommandService(bot)
+    monkeypatch.setattr(service.recommendations.stock_advisor, "_now", lambda: datetime(2026, 10, 15, 1))
 
     async def fake_refresh(session):  # noqa: ANN001
         return {}
@@ -1012,6 +1013,7 @@ async def test_stock_alert_allows_routine_during_market_hours(monkeypatch: pytes
 async def test_stock_alert_suppresses_repeat_symbol_action_even_if_reason_changes(monkeypatch: pytest.MonkeyPatch) -> None:
     bot = TelegramBot()
     service = CommandService(bot)
+    monkeypatch.setattr(service.recommendations.stock_advisor, "_now", lambda: datetime(2026, 10, 15, 17))
     calls = 0
 
     async def fake_refresh(session):  # noqa: ANN001
@@ -1054,6 +1056,7 @@ async def test_stock_alert_suppresses_repeat_symbol_action_even_if_reason_change
 async def test_stock_alert_requires_high_confidence_for_core_buy(monkeypatch: pytest.MonkeyPatch) -> None:
     bot = TelegramBot()
     service = CommandService(bot)
+    monkeypatch.setattr(service.recommendations.stock_advisor, "_now", lambda: datetime(2026, 10, 15, 17))
 
     async def fake_refresh(session):  # noqa: ANN001
         return {}

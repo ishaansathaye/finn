@@ -66,3 +66,16 @@ def test_configured_stale_account_does_not_switch_to_funded_agent(scope):
     service.settings = service.settings.model_copy(update={"primary_portfolio_account_external_id": "old"})
     assert service._position_map(session) == {}
     assert service._current_buying_power(session) == 0
+def test_primary_history_query_limits_rows_in_database(scope):
+    from sqlalchemy import event
+    session, service = scope
+    statements = []
+    def record(conn, cursor, statement, params, context, many):
+        statements.append(statement.lower())
+    engine = session.get_bind()
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        assert service._primary_account_snapshot(session).account_id == "main"
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+    assert any("from accountsnapshot" in sql and "limit" in sql for sql in statements)
