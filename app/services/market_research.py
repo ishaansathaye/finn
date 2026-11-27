@@ -2112,6 +2112,9 @@ class MarketResearchService:
         category_rows: list[EventBetOutcome] = []
         bucket_rows: list[EventBetOutcome] = []
         for row in settled_rows:
+            # An early sale settles trading P/L, not the forecast about the winner.
+            if "cut due to" in (row.notes or "").lower():
+                continue
             position = positions.get(row.event_position_id)
             recommendation = recommendations.get(position.source_recommendation_id) if position and position.source_recommendation_id else None
             rec_category = self._event_category_from_recommendation_symbol(recommendation.symbol) if recommendation else None

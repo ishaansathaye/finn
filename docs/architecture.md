@@ -25,6 +25,31 @@ submission. Live quote, payout, stake and account checks apply at execution.
 Management can cut, add or change supported positions according to configuration
 and approval policy. This is experimental strategy logic, not loss prevention.
 
+An open contract is not a new purchase: automatic exits compare the held
+side's independently estimated payout to its executable sale value, not the
+entry edge or the last trade. The initial independent feed covers matched
+NFL, NBA and MLB full-game winners only. Two distinct, recent play updates at least 15
+seconds apart must favor selling by six cents after a two-cent cost allowance.
+The first two minutes after acquisition, missing or wide books, stale plays
+and ambiguous matchups cannot force a sale. These margins are policy buffers,
+not a measured prediction advantage or an exact broker fee schedule.
+Even during the opening two minutes, exceptional deterioration confirmed by
+two post-entry plays can request approval, never force an exit.
+
+Only small positions within the configured event exposure cap can be sold
+automatically. Larger exits need a Telegram approval. Without independent
+evidence, a bid down at least 15 cents and 25 percent from cost on distinct
+book updates can prompt an approval-only defensive exit. A flip also needs a
+separate opportunity on the other side, approval, a complete closing fill
+and a fresh entry check. A partial fill is not a full exit. An ambiguous
+broker acknowledgement blocks duplicate exits until reconciled.
+
+The first confirmed exit candidate is journaled per position. Bet statistics
+compare that hypothetical exit with holding when a broker settlement or
+unambiguous final game winner is known; unresolved outcomes stay unresolved.
+Exit P/L remains in financial risk metrics, not in the hit rate of the
+original forecast.
+
 ## Integrations
 
 - Robinhood private adapters: account/event data and event-contract execution.

@@ -37,6 +37,7 @@ from app.models import (
     Holding,
 )
 from app.services.market_research import EventIdea, EventSlateItem, StockIdea
+from app.services.event_exit_policy import ExitDecision
 from app.telegram_bot import TelegramBot
 
 
@@ -1132,7 +1133,7 @@ def test_prediction_buying_power_prefers_main_individual_investing_account() -> 
 
 
 @pytest.mark.asyncio
-async def test_medium_event_position_uses_auto_manage_lane(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_medium_event_position_requires_approval(monkeypatch: pytest.MonkeyPatch) -> None:
     bot = TelegramBot()
     service = CommandService(bot)
 
@@ -1163,6 +1164,7 @@ async def test_medium_event_position_uses_auto_manage_lane(monkeypatch: pytest.M
     monkeypatch.setattr(service.recommendations, "refresh_event_watch_state", fake_refresh_watch)
     monkeypatch.setattr(service.recommendations, "_build_position_control_packet", fake_packet)
     monkeypatch.setattr(service.recommendations, "_auto_close_event_position", fake_auto_close)
+    monkeypatch.setattr(service.recommendations, "_exit_decision", AsyncMock(return_value=ExitDecision("cut", "Independent evidence favors selling.")))
     monkeypatch.setattr(service.recommendations.market_research.robinhood_prediction, "get_marketdata_quotes", fake_quotes)
 
     with get_session() as session:
@@ -1185,18 +1187,21 @@ async def test_medium_event_position_uses_auto_manage_lane(monkeypatch: pytest.M
         session.commit()
 
         manual_batch = await service.recommendations.process_event_position_controls(session, include_auto=False, include_manual=True)
-        assert manual_batch is None
+        assert manual_batch is not None
+        messages = await service.recommendations.format_batch_messages(session, manual_batch.id)
+        assert "Independent evidence favors selling" in messages[0]
+        assert "approve" in messages[0]
 
         auto_batch = await service.recommendations.process_event_position_controls(session, include_auto=True, include_manual=False)
-        assert auto_batch is not None
-        messages = await service.recommendations.format_batch_messages(session, auto_batch.id)
-        assert "Finn Auto-Manage: gs" in messages[0]
+        assert auto_batch is None
 
 
 @pytest.mark.asyncio
 async def test_auto_manage_failure_is_not_spammed(monkeypatch: pytest.MonkeyPatch) -> None:
     bot = TelegramBot()
     service = CommandService(bot)
+    monkeypatch.setattr(service.recommendations, "_exit_decision", AsyncMock(return_value=ExitDecision("cut", "Confirmed deterioration.")))
+    monkeypatch.setattr(service.recommendations, "_verify_exit_inventory", AsyncMock(return_value=True))
 
     async def fake_refresh_outcomes(session):  # noqa: ANN001
         return None
@@ -1261,6 +1266,8 @@ async def test_auto_manage_failure_is_not_spammed(monkeypatch: pytest.MonkeyPatc
 async def test_auto_manage_code9_failure_is_humanized_and_not_spammed(monkeypatch: pytest.MonkeyPatch) -> None:
     bot = TelegramBot()
     service = CommandService(bot)
+    monkeypatch.setattr(service.recommendations, "_exit_decision", AsyncMock(return_value=ExitDecision("cut", "Confirmed deterioration.")))
+    monkeypatch.setattr(service.recommendations, "_verify_exit_inventory", AsyncMock(return_value=True))
 
     async def fake_refresh_outcomes(session):  # noqa: ANN001
         return None
@@ -1298,12 +1305,12 @@ async def test_auto_manage_code9_failure_is_humanized_and_not_spammed(monkeypatc
             EventPosition(
                 event_code="event-1",
                 side="yes",
-                amount_usd=4.73,
+                amount_usd=3.01,
                 source="robinhood",
                 status="broker_filled",
                 broker_contract_id="contract-1",
                 broker_event_id="event-1",
-                quantity=11,
+                quantity=7,
                 avg_fill_price=0.43,
                 event_title="2026 Group G Belgium vs Egypt",
                 pick_label="Egypt",
@@ -1328,6 +1335,7 @@ async def test_auto_manage_code9_failure_is_humanized_and_not_spammed(monkeypatc
 async def test_user_approved_cut_uses_position_alert_label(monkeypatch: pytest.MonkeyPatch) -> None:
     bot = TelegramBot()
     service = CommandService(bot)
+    monkeypatch.setattr(service.recommendations, "_verify_exit_inventory", AsyncMock(return_value=True))
 
     async def fake_order(**kwargs):  # noqa: ANN001
         return {

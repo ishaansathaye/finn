@@ -14,6 +14,8 @@ from sqlmodel import Session, select
 
 from app.adapters.snaptrade import SnapTradeAdapter
 from app.config import get_settings
+from app.services.event_exit_policy import ExitDecision, evaluate, exit_bid, number, timestamp
+from app.services.sports_exit_evidence import CONTRACT, SportsExitEvidence
 from app.models import EventBetOutcome, EventDecisionSnapshot, EventPosition, EventPriceSnapshot, EventStateSnapshot, EventWatch, Execution, IntegrationState, Recommendation, RecommendationBatch, RecommendationOutcome, ReportLog
 from app.services.market_research import MarketResearchService
 from app.services.portfolio_sync import PortfolioSyncService
@@ -56,6 +58,7 @@ SERIES_CODE_MAPS: dict[str, dict[str, str]] = {
 class RecommendationService:
     def __init__(self) -> None:
         self.settings = get_settings()
+        self.exit_evidence = SportsExitEvidence()
         self.market_research = MarketResearchService()
         self.portfolio_sync = PortfolioSyncService(SnapTradeAdapter())
         self.stock_advisor = StockAdvisorService(self.market_research)
@@ -643,7 +646,7 @@ class RecommendationService:
             recommendations = self.recommendations_for_batch(session, batch_id)
             lines = [
                 "<b>Finn Position Alert: g</b>",
-                "Finn wants to change one or more open medium/high-stake event positions.",
+                "These changes to open bets need your approval. No order has been placed.",
                 "",
             ]
             for rec in recommendations:
@@ -655,6 +658,8 @@ class RecommendationService:
                 )
                 why_text, numbers_text = self._event_reason_bits(str(rec.reason))
                 action = self._control_recommendation_action(rec).upper()
+                if action == "CUT":
+                    why_text, numbers_text = str(rec.reason).partition(". ")[2] or rec.reason, ""
                 lines.append(f"{rec.item_number}. <b>{escape(event_name)}</b>")
                 meta_bits = [bit for bit in (category, time_label) if bit]
                 if meta_bits:
@@ -1364,17 +1369,7 @@ class RecommendationService:
             session.add(row)
             changed = True
 
-        opening_side_by_contract: dict[str, str] = {}
-        for order in orders:
-            try:
-                leg0 = (order.get("orderLegs") or [{}])[0]
-            except Exception:
-                leg0 = {}
-            contract_id0 = str(leg0.get("contractId") or "")
-            order_side0 = str(leg0.get("orderSide") or "BUY").upper()
-            placement0 = str(order.get("positionEffectAtPlacementTime") or "").upper()
-            if contract_id0 and placement0 == "OPENING":
-                opening_side_by_contract[contract_id0] = "no" if order_side0 == "SELL" else "yes"
+        opening_side_by_contract = self._opening_sides(orders)
 
         live_position_ids: set[str] = set()
 
@@ -1447,6 +1442,8 @@ class RecommendationService:
             placement_effect = str(order.get("positionEffectAtPlacementTime") or "").upper()
             if placement_effect == "CLOSING":
                 continue
+            if any(str(p.get("contractId") or "") == broker_contract_id for p in positions):
+                continue  # Current inventory supersedes historical opening fills.
             if filled_quantity <= 0 and derived_state not in {"QUEUED", "CONFIRMED", "PENDING", "OPEN", "ACTIVE"}:
                 continue
             row = self._lookup_event_position(
@@ -1455,6 +1452,8 @@ class RecommendationService:
                 broker_contract_id=broker_contract_id,
                 broker_event_id=str(meta.get("event_id") or ""),
             )
+            if row is not None and self._event_position_has_settled_outcome(session, row):
+                continue
             if row is None:
                 row = EventPosition(
                     event_code=str(meta.get("event_id") or broker_contract_id or "UNKNOWN"),
@@ -1870,7 +1869,10 @@ class RecommendationService:
         lines.append(f"Cash back: <b>${total_payout:.2f}</b>")
         lines.append(f"Realized P/L: <b>${total_profit:.2f}</b>")
         lines.append(f"ROI: <b>{roi:.1f}%</b>")
-        lines.append(f"Hit rate: <b>{hit_rate:.1f}%</b>")
+        lines.append(f"Closed trades at breakeven or better: <b>{hit_rate:.1f}%</b> (not pick accuracy)")
+        audit = await self._exit_review_summary(session)
+        if audit:
+            lines.append(audit)
         lines.append(f"Wins: <b>{len(wins)}</b>")
         lines.append(f"Losses: <b>{len(losses)}</b>")
         lines.append(f"Open: <b>{len(open_rows)}</b>")
@@ -2436,7 +2438,75 @@ class RecommendationService:
         return str(position.status or "") in {"manual_confirmed", "assumed_open", "broker_open", "broker_order_open", "broker_filled"}
 
     def _position_is_auto_managed(self, position: EventPosition) -> bool:
-        return True
+        cost = number(position.amount_usd)
+        implied = (number(position.quantity) or 0) * (number(position.avg_fill_price) or 0)
+        return cost is not None and 0 < cost and max(cost, implied) <= self.settings.gs_auto_manage_max_stake_usd
+
+    def _opposite_entry_qualifies(self, verdict, position, packet):
+        key = "edge_no" if position.side.lower() == "yes" else "edge_yes"
+        return (verdict.mode == "cut" and verdict.opposite_edge >= .15
+                and float(packet.get(key) or 0) >= self.settings.event_edge_alert_threshold)
+
+    def _confirmed_position(self, position):
+        qty = number(position.quantity)
+        return (position.source == "robinhood" and position.status in {"broker_open", "broker_filled"}
+                and qty is not None and qty > 0 and qty.is_integer() and position.broker_contract_id)
+
+    async def _exit_review_summary(self, session):
+        rows = session.exec(select(IntegrationState).where(IntegrationState.provider == "event_exit_review")).all()
+        helped = hurt = even = pending = lookups = 0
+        for row in rows:
+            data = json.loads(row.value)
+            payout = data.get("held_payout")
+            if payout is None:
+                outcome = session.exec(select(EventBetOutcome).where(EventBetOutcome.event_position_id == data["position_id"])).first()
+                if outcome and outcome.settlement_price in (0., 1.) and (outcome.notes or "").startswith("Robinhood settlement"):
+                    payout = int(outcome.settlement_price)
+                    data["resolution"] = "broker settlement"
+                elif lookups < 3 and CONTRACT.fullmatch(data.get("symbol", "")) and datetime.now(UTC).timestamp() - data.get("last_check", 0) > 3600:
+                    lookups += 1
+                    data["last_check"] = datetime.now(UTC).timestamp()
+                    win = await self.exit_evidence.final_yes(data["symbol"])
+                    if win is not None:
+                        payout = int(win if data["side"] == "yes" else not win)
+                        data["resolution"] = "final game winner, not a broker settlement"
+                if payout is not None:
+                    data["held_payout"] = payout
+                row.value = json.dumps(data)
+                session.add(row)
+            if payout is None:
+                pending += 1
+                continue
+            delta = round((max(0., data["bid"] - .02) - payout) * data["quantity"], 2)
+            helped += int(delta > 0)
+            hurt += int(delta < 0)
+            even += int(delta == 0)
+        if rows:
+            session.commit()
+            return (f"Exit reviews vs holding (hypothetical, not fills): {helped} better, {hurt} worse, "
+                    f"{even} even, {pending} unresolved.")
+        return ""
+
+    async def _exit_decision(self, session, position, quote):
+        if not self._confirmed_position(position):
+            return ExitDecision()
+        game = await self.exit_evidence.get(quote.get("symbol"))
+        now = datetime.now(UTC).timestamp()
+        key = f"{position.id}:{position.side}:{position.broker_contract_id}:{position.opened_at or position.created_at}"
+        previous = self._load_json_state(session, "event_exit_evidence", key)
+        decision = evaluate(side=position.side.lower(), entry=position.avg_fill_price,
+                            opened=timestamp(position.opened_at or position.created_at), quote=quote,
+                            game=game, previous=previous, now=now)
+        if (decision.state or {}) != previous:
+            self._save_json_state(session, "event_exit_evidence", key, decision.state)
+        if decision.mode in {"cut", "review"} and not self._integration_state(session, "event_exit_review", key):
+            self._save_json_state(session, "event_exit_review", key, {
+                "position_id": position.id, "side": position.side, "contract": position.broker_contract_id,
+                "symbol": str(quote.get("symbol") or ""),
+                "quantity": position.quantity, "entry": position.avg_fill_price, "at": now,
+                "bid": exit_bid(quote, position.side.lower(), now), "mode": decision.mode, "reason": decision.reason,
+            })
+        return decision
 
     def _position_control_state_key(self, position: EventPosition, action: str) -> str:
         return f"{position.id}:{action}"
@@ -2493,8 +2563,16 @@ class RecommendationService:
         )
 
     def _auto_manage_message_failed(self, message: str) -> bool:
-        text = message.lower()
-        return any(marker in text for marker in ("failed", "skipped", "unavailable", "not tradable", "missing"))
+        text = message.lower().split("\nwhy:", 1)[0]
+        return any(marker in text for marker in ("failed", "skipped", "unavailable", "not tradable", "missing",
+                                                 "could not", "no fill", "not filled", "reconciliation required"))
+
+    def _control_result_status(self, message):
+        if self._auto_manage_message_failed(message):
+            return "failed"
+        if "cut partially filled" in message:
+            return "partially_filled"
+        return "submitted" if "submitted" in message.lower() else "executed"
 
     def _humanize_event_order_failure(self, exc: Exception) -> str:
         text = str(exc)
@@ -2849,6 +2927,8 @@ class RecommendationService:
         )
 
     def _position_cut_reason(self, position: EventPosition, packet: dict, watch: EventWatch | None = None) -> str:
+        if packet.get("exit_reason"):
+            return str(packet["exit_reason"])
         current_side = str(position.side or "yes").lower()
         entry_probability = float(position.avg_fill_price or 0.0)
         if current_side == "no":
@@ -2875,6 +2955,51 @@ class RecommendationService:
         reason_bits.append("Scoreboard can look favorable while the Robinhood price/model edge says the risk-adjusted bet is no longer attractive.")
         return " ".join(reason_bits)
 
+    @staticmethod
+    def _opening_sides(orders):
+        latest = {}
+        for order in orders:
+            legs = order.get("orderLegs") or []
+            if (str(order.get("positionEffectAtPlacementTime")).upper() != "OPENING" or len(legs) != 1
+                    or (number(order.get("filledQuantity")) or 0) <= 0):
+                continue
+            contract, side = legs[0].get("contractId"), str(legs[0].get("orderSide")).upper()
+            stamp = timestamp(order.get("createdAt"))
+            if not contract or side not in {"SELL", "BUY"} or stamp is None:
+                continue
+            if contract not in latest or latest[contract][0] < stamp:
+                latest[contract] = (stamp, "no" if side == "SELL" else "yes")
+        return {contract: pair[1] for contract, pair in latest.items()}
+
+    async def _verify_exit_inventory(self, session, position):
+        adapter = self.market_research.robinhood_prediction
+        account = await adapter.get_event_contract_account()
+        account_id = (account or {}).get("id")
+        if not account_id or position.broker_account_id != account_id:
+            return False
+        key = str(position.broker_contract_id)
+        lock = self._load_json_state(session, "event_exit_order", key)
+        if lock:
+            if not lock.get("order_id"):
+                return False
+            order = await adapter.get_event_order(account_id=account_id, order_id=lock["order_id"])
+            state = (order or {}).get("derivedState") or (order or {}).get("orderState")
+            if str(state).upper() not in {"CANCELED", "CANCELLED", "EXPIRED", "FAILED", "REJECTED", "FILLED"}:
+                return False
+            if number(order.get("filledQuantity") or 0) != lock.get("booked", 0):
+                return False  # Unknown fills must be reconciled before another sale.
+            self._save_json_state(session, "event_exit_order", key, None)
+        rows = await adapter.list_event_positions(account_id=account_id)
+        held = [p for p in rows if p.get("contractId") == key and
+                (not position.broker_position_id or position.broker_position_id == p.get("id"))]
+        if len(held) != 1 or number(held[0].get("quantity")) != position.quantity:
+            return False
+        broker_side = str(held[0].get("side") or "").upper()
+        if broker_side in {"YES", "NO", "LONG", "SHORT"}:
+            return (broker_side in {"YES", "LONG"}) == (position.side.lower() == "yes")
+        orders = await adapter.list_event_orders(account_id=account_id, page_size=100)
+        return self._opening_sides(orders).get(key) == position.side.lower()
+
     async def _auto_close_event_position(self, session: Session, position: EventPosition, quote: dict, packet: dict, watch: EventWatch | None = None, *, auto: bool = True) -> str:
         contract_id = str(position.broker_contract_id or "")
         current_side = str(position.side or "yes").lower()
@@ -2887,7 +3012,18 @@ class RecommendationService:
         decision_reason = self._position_cut_reason(position, packet, watch)
         yes_bid = float(quote.get("yes_bid_price") or 0.0)
         yes_ask = float(quote.get("yes_ask_price") or 0.0)
-        quantity = self._held_position_contract_count(position)
+        if (not self._confirmed_position(position) or (auto and not self._position_is_auto_managed(position))
+                or exit_bid(quote, current_side, datetime.now(UTC).timestamp()) is None):
+            return f"{prefix}\n{escape(display_title)}: cut skipped; position or live exit price is not verified."
+        try:
+            available = await self._verify_exit_inventory(session, position)
+        except Exception:
+            available = False
+        if not available or exit_bid(quote, current_side, datetime.now(UTC).timestamp()) is None:
+            return f"{prefix}\n{escape(display_title)}: cut skipped; broker inventory or a previous exit is not reconciled."
+        if self._load_json_state(session, "event_exit_order", contract_id):
+            return f"{prefix}\nCut skipped: another exit is awaiting reconciliation."
+        quantity = int(position.quantity)
         if current_side == "no":
             limit_price = yes_ask
             order_side = "BUY"
@@ -2905,6 +3041,8 @@ class RecommendationService:
                 "Reason: live exit quote was unavailable, so Finn did not place an order."
             )
         client_order_id = str(uuid4())
+        lock = {"reference": client_order_id, "quantity": quantity, "booked": 0}
+        self._save_json_state(session, "event_exit_order", contract_id, lock)
         try:
             response = await self.market_research.robinhood_prediction.create_event_contract_order(
                 contract_id=contract_id,
@@ -2915,6 +3053,8 @@ class RecommendationService:
                 order_side=order_side,
             )
         except Exception as exc:  # noqa: BLE001
+            if "rejected (400)" in str(exc).lower() or getattr(getattr(exc, "response", None), "status_code", None) == 400:
+                self._save_json_state(session, "event_exit_order", contract_id, None)
             reason = self._humanize_event_order_failure(exc)
             try:
                 await self._refresh_event_bet_outcomes(session)
@@ -2928,16 +3068,21 @@ class RecommendationService:
                 f"Reason: {escape(reason)}"
             )
         order_id = str(response.get("orderId") or response.get("id") or "")
+        lock["order_id"] = order_id
+        self._save_json_state(session, "event_exit_order", contract_id, lock)
         latest_response = dict(response)
-        event_account = await self.market_research.robinhood_prediction.get_event_contract_account()
-        event_account_id = str((event_account or {}).get("id") or "")
-        if event_account_id and order_id:
+        event_account_id = str(position.broker_account_id or "")
+        if event_account_id and order_id and str(response.get("derivedState") or response.get("orderState")).upper() not in {
+            "FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "FAILED",
+        }:
             for _ in range(4):
                 await asyncio.sleep(1)
-                latest_order = await self.market_research.robinhood_prediction.get_event_order(
-                    account_id=event_account_id,
-                    order_id=order_id,
-                )
+                try:
+                    latest_order = await self.market_research.robinhood_prediction.get_event_order(
+                        account_id=event_account_id, order_id=order_id,
+                    )
+                except Exception:
+                    break
                 if latest_order:
                     latest_response = latest_order
                 derived_state = str(latest_response.get("derivedState") or latest_response.get("orderState") or "").upper()
@@ -2953,7 +3098,8 @@ class RecommendationService:
                 recommendation_id=position.source_recommendation_id or "",
                 provider=provider,
                 provider_order_id=order_id or client_order_id,
-                status="filled" if fill_count > 0 else ("canceled" if is_final_without_fill else "submitted"),
+                status=("partially_filled" if 0 < fill_count < quantity else "filled" if fill_count == quantity
+                        else "canceled" if is_final_without_fill else "submitted"),
                 details=json.dumps(latest_response),
             )
         )
@@ -2966,10 +3112,25 @@ class RecommendationService:
             else:
                 proceeds = round(fill_count * average_fill_price, 2)
                 implied_probability = average_fill_price
-            realized_profit = round(proceeds - float(position.amount_usd or 0.0), 2)
-            outcome_row = session.exec(select(EventBetOutcome).where(EventBetOutcome.event_position_id == position.id)).first()
+            if fill_count > quantity:
+                session.commit()
+                return f"{prefix}\nExit reconciliation required: reported fill exceeded verified inventory."
+            filled_cost = round(position.amount_usd * fill_count / quantity, 2)
+            closed = position
+            if fill_count < quantity:
+                closed = EventPosition(
+                    event_code=position.event_code, side=position.side, source="robinhood",
+                    event_title=position.event_title, pick_label=position.pick_label, category=position.category,
+                    time_label=position.time_label, opened_at=position.opened_at, amount_usd=filled_cost,
+                    quantity=fill_count, avg_fill_price=position.avg_fill_price,
+                )
+                position.quantity = quantity - fill_count
+                position.amount_usd = round(position.amount_usd - filled_cost, 2)
+                session.add(position)
+            realized_profit = round(proceeds - filled_cost, 2)
+            outcome_row = session.exec(select(EventBetOutcome).where(EventBetOutcome.event_position_id == closed.id)).first()
             if outcome_row is None:
-                outcome_row = EventBetOutcome(event_position_id=position.id, event_code=position.event_code)
+                outcome_row = EventBetOutcome(event_position_id=closed.id, event_code=position.event_code)
             outcome_row.outcome = "won" if realized_profit >= 0 else "lost"
             outcome_row.payout_usd = proceeds
             outcome_row.profit_usd = realized_profit
@@ -2978,8 +3139,8 @@ class RecommendationService:
             outcome_row.checked_at = datetime.now(UTC).replace(tzinfo=None)
             outcome_row.notes = "Finn cut due to adverse live edge" if auto else "Finn user-approved cut due to adverse live edge"
             session.add(outcome_row)
-            position.status = "settled_win" if realized_profit >= 0 else "settled_loss"
-            session.add(position)
+            closed.status = "settled_win" if realized_profit >= 0 else "settled_loss"
+            session.add(closed)
             session.add(
                 EventDecisionSnapshot(
                     event_key=str(position.broker_event_id or position.event_code or contract_id),
@@ -2994,17 +3155,20 @@ class RecommendationService:
                 )
             )
             session.commit()
+            self._save_json_state(session, "event_exit_order", contract_id,
+                                  None if fill_count == quantity else {**lock, "booked": fill_count})
             return (
                 f"{prefix}\n"
                 f"Event: <b>{escape(display_title)}</b>\n"
                 f"Pick: <b>{escape(display_pick)}</b>\n"
-                "Action: <b>cut filled</b>\n"
+                f"Action: <b>{'cut filled' if fill_count == quantity else 'cut partially filled'}</b>\n"
                 f"Exit fill: <b>{fill_count}</b> at <b>${average_fill_price:.4f}</b>\n"
                 f"Cash back: <b>${proceeds:.2f}</b> • Realized P/L: <b>${realized_profit:.2f}</b>\n"
                 f"Why: {escape(decision_reason)}"
             )
         session.commit()
         if is_final_without_fill:
+            self._save_json_state(session, "event_exit_order", contract_id, None)
             return (
                 f"{prefix}\n"
                 f"Event: <b>{escape(display_title)}</b>\n"
@@ -3031,14 +3195,14 @@ class RecommendationService:
         control_position_id = str(meta.get("control_position_id") or "")
         if control_position_id:
             direct = session.get(EventPosition, control_position_id)
-            if direct is not None and self._event_position_is_open(direct) and not self._event_position_has_settled_outcome(session, direct):
+            if (direct is not None and self._event_position_is_open(direct)
+                    and str(direct.broker_contract_id or "") == str(meta.get("execution_contract_id") or "")
+                    and not self._event_position_has_settled_outcome(session, direct)):
                 return direct
+            return None
         contract_id = str(meta.get("execution_contract_id") or "")
-        event_code = str(recommendation.event_code or "")
         for position in self._open_broker_event_positions(session):
             if contract_id and str(position.broker_contract_id or "") == contract_id:
-                return position
-            if event_code and str(position.broker_event_id or position.event_code or "") == event_code:
                 return position
         return None
 
@@ -3046,7 +3210,9 @@ class RecommendationService:
         actionable: list[tuple[Recommendation, EventPosition]] = []
         for recommendation in recommendations:
             position = self._position_for_control_recommendation(session, recommendation)
-            if position is None:
+            if (position is None or not self._confirmed_position(position)
+                    or recommendation.status != "pending"
+                    or (timestamp(recommendation.valid_until) or 0) < datetime.now(UTC).timestamp()):
                 recommendation.status = "failed"
                 session.add(recommendation)
                 continue
@@ -3058,11 +3224,19 @@ class RecommendationService:
         contract_ids = [str(position.broker_contract_id or "") for _recommendation, position in actionable if str(position.broker_contract_id or "")]
         quote_rows = await self.market_research.robinhood_prediction.get_marketdata_quotes(contract_ids) if contract_ids else {}
         messages: list[str] = []
+        observed = datetime.now(UTC).timestamp()
         for recommendation, position in actionable:
             action = self._control_recommendation_action(recommendation)
+            expected_side = ("no" if position.side.lower() == "yes" else "yes") if action == "flip" else position.side.lower()
+            if recommendation.side.lower() != expected_side or (action in {"cut", "flip"} and
+                    abs(recommendation.amount_usd - position.amount_usd) > .01):
+                recommendation.status = "skipped"
+                session.add(recommendation)
+                messages.append("Position changed since the alert. No order was placed.")
+                continue
             contract_id = str(position.broker_contract_id or "")
-            quote = quote_rows.get(contract_id) or {}
-            if not quote:
+            quote = {**(quote_rows.get(contract_id) or {}), "_observed": observed}
+            if exit_bid(quote, position.side.lower(), datetime.now(UTC).timestamp()) is None:
                 recommendation.status = "failed"
                 session.add(recommendation)
                 messages.append(
@@ -3072,19 +3246,47 @@ class RecommendationService:
                 continue
             watch = watch_map.get(str(position.broker_event_id or position.event_code or ""))
             packet = self._build_position_control_packet(session, position, quote, watch)
+            verdict = await self._exit_decision(session, position, quote)
             if action == "add":
+                if verdict.mode != "hold" or exit_bid(quote, position.side.lower(), datetime.now(UTC).timestamp()) is None:
+                    recommendation.status = "skipped"
+                    session.add(recommendation)
+                    messages.append("Add skipped: the exit review or current book no longer supports adding.")
+                    continue
                 messages.append(await self._open_added_event_position(session, position, quote, packet, recommendation, auto=False))
             else:
+                if action not in {"cut", "flip"} or verdict.mode not in {"cut", "review"} or (
+                        action == "flip" and not self._opposite_entry_qualifies(verdict, position, packet)):
+                    recommendation.status = "skipped"
+                    session.add(recommendation)
+                    messages.append("Exit skipped: the evidence no longer supports this action. No order was placed.")
+                    continue
+                packet["exit_reason"] = verdict.reason
                 close_message = await self._auto_close_event_position(session, position, quote, packet, watch, auto=False)
-                if action == "flip":
-                    follow_message = await self._open_flipped_event_position(session, position, quote, packet, recommendation)
-                    messages.append(close_message + "\n" + follow_message)
-                else:
-                    messages.append(close_message)
-            recommendation.status = "executed"
+                messages.append(close_message)
+                if action == "flip" and "Action: <b>cut filled</b>" in close_message:
+                    latest = (await self.market_research.robinhood_prediction.get_marketdata_quotes([contract_id])).get(contract_id) or {}
+                    check = await self._exit_decision_for_flip(session, position, latest)
+                    if check:
+                        messages.append(await self._open_flipped_event_position(session, position, latest, check, recommendation))
+                    else:
+                        messages.append("Opposite entry skipped: the fresh quote or evidence no longer qualifies.")
+            recommendation.status = self._control_result_status(messages[-1])
             session.add(recommendation)
         session.commit()
         return "\n\n".join(messages) if messages else "No executable live position changes remained."
+
+    async def _exit_decision_for_flip(self, session, position, quote):
+        now = datetime.now(UTC).timestamp()
+        side = position.side.lower()
+        bid = exit_bid(quote, side, now)
+        game = await self.exit_evidence.get(quote.get("symbol"))
+        if bid is None or not game or not -3 <= now - game.at <= 120:
+            return None
+        fair = game.yes_probability if side == "yes" else 1 - game.yes_probability
+        packet = self._build_position_control_packet(session, position, quote, None)
+        packet["no_entry_price"] = 1 - float(quote["yes_bid_price"])
+        return packet if self._opposite_entry_qualifies(ExitDecision("cut", opposite_edge=bid-.02-fair), position, packet) else None
 
     async def process_event_position_controls(
         self,
@@ -3108,13 +3310,15 @@ class RecommendationService:
         contract_ids = [str(position.broker_contract_id or "") for position in positions if str(position.broker_contract_id or "")]
         quote_rows = await self.market_research.robinhood_prediction.get_marketdata_quotes(contract_ids) if contract_ids else {}
         control_rows: list[dict[str, object]] = []
+        observed = datetime.now(UTC).timestamp()
         for position in positions:
             position_side = str(position.side or "yes").lower()
-            if position_side not in {"yes", "no"}:
+            if position_side not in {"yes", "no"} or not self._confirmed_position(position):
                 continue
             contract_id = str(position.broker_contract_id or "")
-            quote = quote_rows.get(contract_id) or {}
-            if not quote:
+            quote = {**(quote_rows.get(contract_id) or {}), "_observed": observed}
+            if exit_bid(quote, position_side, datetime.now(UTC).timestamp()) is None:
+                await self._exit_decision(session, position, {})
                 continue
             watch = watch_map.get(str(position.broker_event_id or position.event_code or ""))
             packet = self._build_position_control_packet(session, position, quote, watch)
@@ -3152,12 +3356,25 @@ class RecommendationService:
                     and self._position_add_count(session, position, "no") < self.settings.event_position_max_adds
                 )
                 suggested_action = "flip" if edge_yes >= self.settings.event_edge_alert_threshold else "cut"
-            if add_candidate and not thesis_broken:
+            verdict = await self._exit_decision(session, position, quote)
+            exposure = sum(p.amount_usd for p in positions if (p.broker_event_id or p.event_code) ==
+                           (position.broker_event_id or position.event_code))
+            auto_lane = self._position_is_auto_managed(position) and exposure <= self.settings.gs_auto_manage_max_stake_usd
+            if verdict.mode in {"cut", "review"}:
+                suggested_action = "cut"
+                packet["exit_reason"] = verdict.reason
+                auto_lane = auto_lane and verdict.mode == "cut"
+                if not auto_lane and self._opposite_entry_qualifies(verdict, position, packet):
+                    suggested_action = "flip"
+            elif verdict.mode == "hold" and add_candidate and not thesis_broken:
                 suggested_action = "add"
-            elif not thesis_broken:
+                if auto_lane:
+                    auto_lane = (exposure + self._position_add_amount(session, position, packet, auto=True)
+                                 <= self.settings.gs_auto_manage_max_stake_usd)
+            else:
                 continue
             fingerprint = f"{position_side}|{round(edge_yes,4)}|{round(edge_no,4)}|{round(market_move,4)}|{watch.last_event_status if watch else ''}|{watch.last_score_summary if watch else ''}" if watch else f"{position_side}|{round(edge_yes,4)}|{round(edge_no,4)}|{round(market_move,4)}"
-            if self._position_is_auto_managed(position):
+            if auto_lane:
                 if not include_auto:
                     continue
                 auto_action = "auto_add" if suggested_action == "add" and self.settings.gs_auto_add_enabled else "auto_cut"
@@ -3208,7 +3425,7 @@ class RecommendationService:
                             risk="medium",
                             execution_mode="info",
                             valid_until=datetime.now(UTC).replace(tzinfo=None) + timedelta(minutes=self.settings.event_trade_validity_minutes),
-                            status="failed" if auto_failed else "executed",
+                            status=self._control_result_status(auto_message),
                         )
                     )
                     session.commit()
@@ -3249,6 +3466,8 @@ class RecommendationService:
             market_yes = float(row["market_yes"])
             fair_yes = float(row["fair_yes"])
             edge_yes = float(row["edge_yes"])
+            fair_no = 1 - fair_yes
+            edge_no = float(packet.get("edge_no") or 0)
             target_side = "no" if position.side.lower() == "yes" else "yes"
             side = target_side if action == "flip" else position.side.lower()
             action_word = action
@@ -3258,6 +3477,9 @@ class RecommendationService:
             control_amount = self._position_add_amount(session, position, packet, auto=False) if action == "add" else float(position.amount_usd or 0.0)
             if action == "cut":
                 reason = f"Finn recommends CUT for this live position. {self._position_cut_reason(position, packet, watch)}"
+            elif action == "flip":
+                reason = (f"Finn recommends FLIP for this live position. {self._position_cut_reason(position, packet, watch)} "
+                          f"Opposite pick: {target_pick}. Only enter after a full exit and a fresh price check.")
             else:
                 reason = (
                     f"Finn recommends {action_word.upper()} for this live position."
@@ -3312,7 +3534,7 @@ class RecommendationService:
                     market_implied=market_yes or None,
                     fair_implied=fair_yes or None,
                     confidence="high" if edge_yes <= self.settings.gs_auto_cut_edge_threshold * 1.5 else "medium",
-                    reason_summary=f"Manual {action} recommended after live edge evaluation",
+                    reason_summary=reason[:500],
                 )
             )
         session.commit()
